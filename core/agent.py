@@ -13,18 +13,7 @@ from core.response import ModelResponse
 from core.tool_call import ToolCall
 from core.message import Message
 from core.invoke_options import InvokeOptions
-
-
-class AgentRequestError(RuntimeError):
-    def __init__(
-        self,
-        message: str,
-        *,
-        retryable: bool = False,
-    ) -> None:
-        super().__init__(message)
-        self.retryable = retryable
-
+from error.request_error import AgentRequestError
 
 class Agent:
     def __init__(
