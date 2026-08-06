@@ -19,9 +19,9 @@ class Agent:
     def __init__(
         self,
         *,
-        base_url: str,
-        api_key: str,
-        model_id: str,
+        base_url: str | None,
+        api_key: str | None,
+        model_id: str | None,
         timeout: float = 60.0,
         max_retries: int = 3,
         retry_backoff: float = 1.5,

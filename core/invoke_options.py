@@ -1,6 +1,6 @@
 from dataclasses import dataclass
 from typing import Any, Literal
-from tool_space import ToolSpec
+from core.tool_space import ToolSpec
 
 @dataclass
 class InvokeOptions:

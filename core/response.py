@@ -1,6 +1,6 @@
 from pydantic import BaseModel
-from tool_call import ToolCall
-from token_usage import TokenUsage
+from core.tool_call import ToolCall
+from core.token_usage import TokenUsage
 
 class ModelResponse(BaseModel):
     id: str | None = None
