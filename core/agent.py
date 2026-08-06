@@ -1,16 +1,18 @@
 from __future__ import annotations
 
 import asyncio
+from datetime import datetime
 import json
 import urllib.error
 import urllib.request
 import uuid
+from types import CoroutineType
 from typing import Any
 
 from core.response import ModelResponse
-from tool_call import ToolCall
-from message import Message
-from invoke_options import InvokeOptions
+from core.tool_call import ToolCall
+from core.message import Message
+from core.invoke_options import InvokeOptions
 
 
 class AgentRequestError(RuntimeError):
@@ -43,12 +45,13 @@ class Agent:
         self.max_retries = max_retries
         self.retry_backoff = retry_backoff
         self.default_headers = default_headers or {}
+        self.history = []
 
     async def ainvoke(
         self,
         messages: list["Message"],
-        options: "InvokeOptions | None" = None,
-    ) -> "ModelResponse":
+        options: InvokeOptions | None = None,
+    ) -> ModelResponse:
         if not messages:
             raise ValueError("messages 不能为空")
 
@@ -116,6 +119,24 @@ class Agent:
         )
 
         return self._parse_chat_response(raw_response)
+
+    def chat(self, user_message: str) -> ModelResponse:
+        msg = Message(
+            role="user",
+            content=user_message,
+            timestamp=datetime.now().isoformat(),
+        )
+        response = asyncio.run(self.ainvoke([msg]))
+        self.history.append({
+            "role": "user",
+            "message": msg,
+        })
+        self.history.append({
+            "role": "assistant",
+            "message": response,
+        })
+        return response
+
 
     async def _post_json(
         self,
