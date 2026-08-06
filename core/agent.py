@@ -6,6 +6,7 @@ import json
 import urllib.error
 import urllib.request
 import uuid
+from idlelib import history
 from types import CoroutineType
 from typing import Any
 
@@ -38,10 +39,10 @@ class Agent:
 
     async def ainvoke(
         self,
-        messages: list["Message"],
+        message:Message,
         options: InvokeOptions | None = None,
     ) -> ModelResponse:
-        if not messages:
+        if not message:
             raise ValueError("messages 不能为空")
 
         options = options or InvokeOptions()
@@ -49,8 +50,8 @@ class Agent:
         payload: dict[str, Any] = {
             "model": self.model_id,
             "messages": [
-                self._serialize_message(message)
-                for message in messages
+                self._serialize_message(msg)
+                for msg in self.history + [message]
             ],
         }
 
@@ -115,15 +116,14 @@ class Agent:
             content=user_message,
             timestamp=datetime.now().isoformat(),
         )
-        response = asyncio.run(self.ainvoke([msg]))
-        self.history.append({
-            "role": "user",
-            "message": msg,
-        })
-        self.history.append({
-            "role": "assistant",
-            "message": response,
-        })
+        response = asyncio.run(self.ainvoke(msg))
+        self.history.append(msg)
+        self.history.append(
+             Message(
+                role="assistant",
+                content=response.text,
+                timestamp=datetime.now().isoformat(),
+            ))
         return response
 
 
