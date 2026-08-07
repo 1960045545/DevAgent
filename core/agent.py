@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
+from dataclasses import replace
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any, Callable, Iterator
 
 from openai import OpenAI
 
@@ -11,6 +13,8 @@ from core.invoke_options import InvokeOptions
 from core.message import Message
 from core.response import ModelResponse
 from core.tool_call import ToolCall
+from core.tool_registry import ToolRegistry
+from core.tool_space import ToolSpec
 from error.request_error import AgentRequestError
 
 
@@ -27,6 +31,7 @@ class Agent:
         default_headers: dict[str, str] | None = None,
         max_tokens: int = 1000,
         client: OpenAI | None = None,
+        tool_registry: ToolRegistry | None = None,
     ) -> None:
         self.base_url = base_url.rstrip("/") if base_url else None
         self.api_key = api_key
@@ -39,6 +44,17 @@ class Agent:
         self.max_tokens = max_tokens
         self.rounds = 3
         self.client = client or self._create_client()
+        self.tool_registry = tool_registry or ToolRegistry()
+
+    def register_tool(
+        self,
+        spec: ToolSpec,
+        handler: Callable[..., Any],
+    ) -> None:
+        self.tool_registry.register(
+            spec,
+            handler,
+        )
 
     async def ainvoke(
         self,
@@ -71,6 +87,21 @@ class Agent:
     ) -> ModelResponse:
         self._compose_history(rounds=self.rounds)
         prompt = self._build_chat_prompt(user_message)
+        options = self._merge_tool_options(
+            options or InvokeOptions()
+        )
+
+        if options.tools:
+            response = self._chat_with_tools(
+                prompt=prompt,
+                user_message=user_message,
+                options=options,
+            )
+            self._append_chat_history(
+                user_message=user_message,
+                assistant_message=response.text,
+            )
+            return response
 
         response = asyncio.run(
             self.ainvoke(
@@ -93,7 +124,22 @@ class Agent:
     ) -> Iterator[str]:
         self._compose_history(rounds=self.rounds)
         prompt = self._build_chat_prompt(user_message)
-        options = options or InvokeOptions()
+        options = self._merge_tool_options(
+            options or InvokeOptions()
+        )
+
+        if options.tools:
+            response = self._chat_with_tools(
+                prompt=prompt,
+                user_message=user_message,
+                options=options,
+            )
+            self._append_chat_history(
+                user_message=user_message,
+                assistant_message=response.text,
+            )
+            yield response.text
+            return
 
         kwargs = self._build_chat_completion_kwargs(
             Message(role="user", content=prompt),
@@ -116,6 +162,116 @@ class Agent:
         self._append_chat_history(
             user_message=user_message,
             assistant_message="".join(chunks),
+        )
+
+    def _merge_tool_options(
+        self,
+        options: InvokeOptions,
+    ) -> InvokeOptions:
+        registered_specs = self.tool_registry.list_specs()
+        registered_handlers = self.tool_registry.handlers()
+
+        if not registered_specs and not options.tools:
+            return options
+
+        specs_by_name: dict[str, Any] = {}
+
+        for spec in registered_specs:
+            specs_by_name[spec.name] = spec
+
+        if options.tools:
+            for spec in options.tools:
+                name = self._tool_spec_name(spec)
+
+                if name:
+                    specs_by_name[name] = spec
+
+        handlers = dict(registered_handlers)
+
+        if options.tool_handlers:
+            handlers.update(options.tool_handlers)
+
+        return replace(
+            options,
+            tools=list(specs_by_name.values()),
+            tool_handlers=handlers,
+        )
+
+    @staticmethod
+    def _tool_spec_name(tool: Any) -> str | None:
+        if hasattr(tool, "name"):
+            return tool.name
+
+        if isinstance(tool, dict):
+            function = tool.get("function") or {}
+            return function.get("name") or tool.get("name")
+
+        return None
+
+    def _chat_with_tools(
+        self,
+        *,
+        prompt: str,
+        user_message: str,
+        options: InvokeOptions,
+    ) -> ModelResponse:
+        if not options.tool_handlers:
+            raise AgentRequestError(
+                "tools require tool_handlers",
+                retryable=False,
+            )
+
+        messages: list[dict[str, Any]] = [
+            {
+                "role": "system",
+                "content": prompt,
+            },
+            {
+                "role": "user",
+                "content": user_message,
+            },
+        ]
+
+        for _ in range(options.max_tool_rounds):
+            kwargs = self._build_chat_completion_kwargs_for_messages(
+                messages,
+                options,
+                stream=False,
+            )
+            raw_response = self.client.chat.completions.create(
+                **kwargs,
+            )
+            data = self._response_to_dict(raw_response)
+            response = self._parse_chat_response(data)
+
+            if not response.tool_calls:
+                return response
+
+            messages.append(
+                self._assistant_message_from_response(data)
+            )
+
+            for tool_call in response.tool_calls:
+                if not tool_call.id:
+                    raise AgentRequestError(
+                        "tool_call id is required",
+                        retryable=False,
+                    )
+
+                messages.append(
+                    {
+                        "role": "tool",
+                        "tool_call_id": tool_call.id,
+                        "content": self._execute_tool_call(
+                            tool_call,
+                            options.tool_handlers,
+                        ),
+                    }
+                )
+
+        raise AgentRequestError(
+            "max tool rounds exceeded",
+            retryable=False,
         )
 
     def _create_client(self) -> OpenAI:
@@ -186,6 +342,130 @@ class Agent:
             kwargs["extra_headers"] = extra_headers
 
         return kwargs
+
+    def _build_chat_completion_kwargs_for_messages(
+        self,
+        messages: list[dict[str, Any]],
+        options: InvokeOptions,
+        *,
+        stream: bool,
+    ) -> dict[str, Any]:
+        kwargs: dict[str, Any] = {
+            "model": self.model_id,
+            "messages": messages,
+            "stream": stream,
+            "timeout": options.timeout or self.timeout,
+        }
+
+        if options.tools:
+            kwargs["tools"] = [
+                self._serialize_tool(tool)
+                for tool in options.tools
+            ]
+
+        if options.tool_choice is not None:
+            kwargs["tool_choice"] = options.tool_choice
+
+        if options.response_format is not None:
+            kwargs["response_format"] = options.response_format
+
+        if options.temperature is not None:
+            kwargs["temperature"] = options.temperature
+
+        if options.top_p is not None:
+            kwargs["top_p"] = options.top_p
+
+        if options.max_output_tokens is not None:
+            kwargs["max_completion_tokens"] = (
+                options.max_output_tokens
+            )
+
+        if options.reasoning_effort is not None:
+            kwargs["reasoning_effort"] = (
+                options.reasoning_effort
+            )
+
+        if options.extra_body:
+            kwargs["extra_body"] = options.extra_body
+
+        extra_headers = dict(self.default_headers)
+
+        if options.extra_headers:
+            extra_headers.update(options.extra_headers)
+
+        if extra_headers:
+            kwargs["extra_headers"] = extra_headers
+
+        return kwargs
+
+    @staticmethod
+    def _assistant_message_from_response(
+        data: dict[str, Any],
+    ) -> dict[str, Any]:
+        choices = data.get("choices") or []
+
+        if not choices:
+            raise AgentRequestError(
+                "Model response has no choices",
+                retryable=False,
+            )
+
+        raw_message = choices[0].get("message") or {}
+        message: dict[str, Any] = {
+            "role": "assistant",
+            "content": raw_message.get("content"),
+        }
+
+        if raw_message.get("tool_calls"):
+            message["tool_calls"] = raw_message["tool_calls"]
+
+        if raw_message.get("function_call"):
+            message["function_call"] = raw_message["function_call"]
+
+        return message
+
+    def _execute_tool_call(
+        self,
+        tool_call: ToolCall,
+        handlers: dict[str, Any],
+    ) -> str:
+        handler = handlers.get(tool_call.name)
+
+        if handler is None:
+            raise AgentRequestError(
+                f"tool handler not found: {tool_call.name}",
+                retryable=False,
+            )
+
+        try:
+            if isinstance(tool_call.arguments, dict):
+                result = handler(**tool_call.arguments)
+            else:
+                result = handler(tool_call.arguments)
+
+            if inspect.isawaitable(result):
+                result = asyncio.run(result)
+
+        except Exception as exc:
+            result = {
+                "error": str(exc),
+            }
+
+        return self._stringify_tool_result(result)
+
+    @staticmethod
+    def _stringify_tool_result(result: Any) -> str:
+        if isinstance(result, str):
+            return result
+
+        try:
+            return json.dumps(
+                result,
+                ensure_ascii=False,
+                default=str,
+            )
+        except TypeError:
+            return str(result)
 
     @staticmethod
     def _response_to_dict(response: Any) -> dict[str, Any]:
@@ -262,7 +542,7 @@ class Agent:
         message = choice.get("message") or {}
         tool_calls = []
 
-        for raw_tool_call in message.get("tool_calls", []):
+        for raw_tool_call in message.get("tool_calls") or []:
             function = raw_tool_call.get("function", {})
             raw_arguments = function.get("arguments", "{}")
 
