@@ -1,20 +1,18 @@
 from __future__ import annotations
 
 import asyncio
-from datetime import datetime
 import json
-import urllib.error
-import urllib.request
-import uuid
-from idlelib import history
-from types import CoroutineType
-from typing import Any
+from pathlib import Path
+from typing import Any, Iterator
 
+from openai import OpenAI
+
+from core.invoke_options import InvokeOptions
+from core.message import Message
 from core.response import ModelResponse
 from core.tool_call import ToolCall
-from core.message import Message
-from core.invoke_options import InvokeOptions
 from error.request_error import AgentRequestError
+
 
 class Agent:
     def __init__(
@@ -27,198 +25,204 @@ class Agent:
         max_retries: int = 3,
         retry_backoff: float = 1.5,
         default_headers: dict[str, str] | None = None,
+        max_tokens: int = 1000,
+        client: OpenAI | None = None,
     ) -> None:
-        self.base_url = base_url.rstrip("/")
+        self.base_url = base_url.rstrip("/") if base_url else None
         self.api_key = api_key
         self.model_id = model_id
         self.timeout = timeout
         self.max_retries = max_retries
         self.retry_backoff = retry_backoff
         self.default_headers = default_headers or {}
-        self.history = []
+        self.history: list[Message] = []
+        self.max_tokens = max_tokens
+        self.rounds = 3
+        self.client = client or self._create_client()
 
     async def ainvoke(
         self,
-        message:Message,
+        message: Message,
         options: InvokeOptions | None = None,
     ) -> ModelResponse:
         if not message:
-            raise ValueError("messages 不能为空")
+            raise ValueError("message can not be empty")
 
         options = options or InvokeOptions()
+        kwargs = self._build_chat_completion_kwargs(
+            message,
+            options,
+            stream=False,
+        )
 
-        payload: dict[str, Any] = {
+        response = await asyncio.to_thread(
+            self.client.chat.completions.create,
+            **kwargs,
+        )
+
+        return self._parse_chat_response(
+            self._response_to_dict(response)
+        )
+
+    def chat(
+        self,
+        user_message: str,
+        options: InvokeOptions | None = None,
+    ) -> ModelResponse:
+        self._compose_history(rounds=self.rounds)
+        prompt = self._build_chat_prompt(user_message)
+
+        response = asyncio.run(
+            self.ainvoke(
+                Message(role="user", content=prompt),
+                options=options,
+            )
+        )
+
+        self._append_chat_history(
+            user_message=user_message,
+            assistant_message=response.text,
+        )
+
+        return response
+
+    def stream_chat(
+        self,
+        user_message: str,
+        options: InvokeOptions | None = None,
+    ) -> Iterator[str]:
+        self._compose_history(rounds=self.rounds)
+        prompt = self._build_chat_prompt(user_message)
+        options = options or InvokeOptions()
+
+        kwargs = self._build_chat_completion_kwargs(
+            Message(role="user", content=prompt),
+            options,
+            stream=True,
+        )
+
+        chunks: list[str] = []
+        stream = self.client.chat.completions.create(**kwargs)
+
+        for event in stream:
+            chunk = self._stream_event_content(event)
+
+            if not chunk:
+                continue
+
+            chunks.append(chunk)
+            yield chunk
+
+        self._append_chat_history(
+            user_message=user_message,
+            assistant_message="".join(chunks),
+        )
+
+    def _create_client(self) -> OpenAI:
+        kwargs: dict[str, Any] = {
+            "api_key": self.api_key,
+            "timeout": self.timeout,
+            "max_retries": self.max_retries,
+        }
+
+        if self.base_url:
+            kwargs["base_url"] = self.base_url
+
+        return OpenAI(**kwargs)
+
+    def _build_chat_completion_kwargs(
+        self,
+        message: Message,
+        options: InvokeOptions,
+        *,
+        stream: bool,
+    ) -> dict[str, Any]:
+        kwargs: dict[str, Any] = {
             "model": self.model_id,
             "messages": [
-                self._serialize_message(msg)
-                for msg in self.history + [message]
+                self._serialize_message(message),
             ],
+            "stream": stream,
+            "timeout": options.timeout or self.timeout,
         }
 
         if options.tools:
-            payload["tools"] = [
+            kwargs["tools"] = [
                 self._serialize_tool(tool)
                 for tool in options.tools
             ]
 
         if options.tool_choice is not None:
-            payload["tool_choice"] = options.tool_choice
+            kwargs["tool_choice"] = options.tool_choice
 
         if options.response_format is not None:
-            payload["response_format"] = options.response_format
+            kwargs["response_format"] = options.response_format
 
         if options.temperature is not None:
-            payload["temperature"] = options.temperature
+            kwargs["temperature"] = options.temperature
 
         if options.top_p is not None:
-            payload["top_p"] = options.top_p
+            kwargs["top_p"] = options.top_p
 
         if options.max_output_tokens is not None:
-            # 部分服务商使用 max_tokens，需要按服务商调整
-            payload["max_completion_tokens"] = (
+            kwargs["max_completion_tokens"] = (
                 options.max_output_tokens
             )
 
         if options.reasoning_effort is not None:
-            payload["reasoning_effort"] = (
+            kwargs["reasoning_effort"] = (
                 options.reasoning_effort
             )
 
         if options.extra_body:
-            payload.update(options.extra_body)
+            kwargs["extra_body"] = options.extra_body
 
-        request_id = str(uuid.uuid4())
-
-        headers = {
-            "Authorization": f"Bearer {self.api_key}",
-            "Content-Type": "application/json",
-            "Accept": "application/json",
-            "X-Client-Request-Id": request_id,
-        }
-
-        headers.update(self.default_headers)
+        extra_headers = dict(self.default_headers)
 
         if options.extra_headers:
-            headers.update(options.extra_headers)
+            extra_headers.update(options.extra_headers)
 
-        raw_response = await self._post_json(
-            url=f"{self.base_url}/chat/completions",
-            payload=payload,
-            headers=headers,
-            timeout=options.timeout or self.timeout,
-        )
+        if extra_headers:
+            kwargs["extra_headers"] = extra_headers
 
-        return self._parse_chat_response(raw_response)
-
-    def chat(self, user_message: str) -> ModelResponse:
-        msg = Message(
-            role="user",
-            content=user_message,
-            timestamp=datetime.now().isoformat(),
-        )
-        response = asyncio.run(self.ainvoke(msg))
-        self.history.append(msg)
-        self.history.append(
-             Message(
-                role="assistant",
-                content=response.text,
-                timestamp=datetime.now().isoformat(),
-            ))
-        return response
-
-
-    async def _post_json(
-        self,
-        *,
-        url: str,
-        payload: dict[str, Any],
-        headers: dict[str, str],
-        timeout: float,
-    ) -> dict[str, Any]:
-        for attempt in range(self.max_retries + 1):
-            try:
-                return await asyncio.to_thread(
-                    self._post_json_sync,
-                    url,
-                    payload,
-                    headers,
-                    timeout,
-                )
-
-            except AgentRequestError as exc:
-                is_last_attempt = attempt >= self.max_retries
-
-                if not exc.retryable or is_last_attempt:
-                    raise
-
-                delay = self.retry_backoff * (2 ** attempt)
-                await asyncio.sleep(delay)
-
-        raise RuntimeError("请求失败")
+        return kwargs
 
     @staticmethod
-    def _post_json_sync(
-        url: str,
-        payload: dict[str, Any],
-        headers: dict[str, str],
-        timeout: float,
-    ) -> dict[str, Any]:
-        body = json.dumps(
-            payload,
-            ensure_ascii=False,
-        ).encode("utf-8")
+    def _response_to_dict(response: Any) -> dict[str, Any]:
+        if hasattr(response, "model_dump"):
+            return response.model_dump()
 
-        request = urllib.request.Request(
-            url=url,
-            data=body,
-            headers=headers,
-            method="POST",
+        if hasattr(response, "dict"):
+            return response.dict()
+
+        if isinstance(response, dict):
+            return response
+
+        raise AgentRequestError(
+            f"Unsupported model response type: {type(response)}",
+            retryable=False,
         )
 
-        try:
-            with urllib.request.urlopen(
-                request,
-                timeout=timeout,
-            ) as response:
-                response_body = response.read()
+    @staticmethod
+    def _stream_event_content(event: Any) -> str:
+        data = Agent._response_to_dict(event)
+        choices = data.get("choices") or []
 
-        except urllib.error.HTTPError as exc:
-            error_body = exc.read().decode(
-                "utf-8",
-                errors="replace",
-            )
+        if not choices:
+            return ""
 
-            retryable = (
-                exc.code == 408
-                or exc.code == 429
-                or exc.code >= 500
-            )
+        choice = choices[0]
+        delta = choice.get("delta") or {}
+        content = delta.get("content")
 
-            raise AgentRequestError(
-                f"HTTP {exc.code}: {error_body}",
-                retryable=retryable,
-            ) from exc
+        if content is None:
+            content = choice.get("text")
 
-        except urllib.error.URLError as exc:
-            raise AgentRequestError(
-                f"网络请求失败: {exc}",
-                retryable=True,
-            ) from exc
-
-        try:
-            return json.loads(
-                response_body.decode("utf-8")
-            )
-
-        except json.JSONDecodeError as exc:
-            raise AgentRequestError(
-                "模型返回的内容不是合法 JSON",
-                retryable=False,
-            ) from exc
+        return content or ""
 
     @staticmethod
     def _serialize_message(
-        message: "Message",
+        message: Message | dict[str, Any],
     ) -> dict[str, Any]:
         if hasattr(message, "to_dict"):
             return message.to_dict()
@@ -227,7 +231,7 @@ class Agent:
             return message
 
         raise TypeError(
-            f"不支持的消息类型: {type(message)}"
+            f"Unsupported message type: {type(message)}"
         )
 
     @staticmethod
@@ -239,39 +243,28 @@ class Agent:
             return tool
 
         raise TypeError(
-            f"不支持的工具类型: {type(tool)}"
+            f"Unsupported tool type: {type(tool)}"
         )
 
     @staticmethod
     def _parse_chat_response(
         data: dict[str, Any],
-    ) -> "ModelResponse":
+    ) -> ModelResponse:
         choices = data.get("choices") or []
 
         if not choices:
             raise AgentRequestError(
-                "模型响应中没有 choices",
+                "Model response has no choices",
                 retryable=False,
             )
 
         choice = choices[0]
         message = choice.get("message") or {}
-
         tool_calls = []
 
-        for raw_tool_call in message.get(
-            "tool_calls",
-            [],
-        ):
-            function = raw_tool_call.get(
-                "function",
-                {},
-            )
-
-            raw_arguments = function.get(
-                "arguments",
-                "{}",
-            )
+        for raw_tool_call in message.get("tool_calls", []):
+            function = raw_tool_call.get("function", {})
+            raw_arguments = function.get("arguments", "{}")
 
             try:
                 arguments = (
@@ -279,10 +272,9 @@ class Agent:
                     if isinstance(raw_arguments, str)
                     else raw_arguments
                 )
-
             except json.JSONDecodeError as exc:
                 raise AgentRequestError(
-                    "工具参数不是合法 JSON",
+                    "Tool arguments are not valid JSON",
                     retryable=False,
                 ) from exc
 
@@ -291,6 +283,7 @@ class Agent:
                     id=raw_tool_call.get("id"),
                     name=function.get("name", ""),
                     arguments=arguments,
+                    raw=raw_tool_call,
                 )
             )
 
@@ -300,8 +293,115 @@ class Agent:
             text=message.get("content") or "",
             tool_calls=tool_calls,
             usage=data.get("usage"),
-            finish_reason=choice.get(
-                "finish_reason"
-            ),
+            finish_reason=choice.get("finish_reason"),
             raw=data,
         )
+
+    def _append_chat_history(
+        self,
+        *,
+        user_message: str,
+        assistant_message: str,
+    ) -> None:
+        self.history.append(
+            Message(role="user", content=user_message)
+        )
+        self.history.append(
+            Message(role="assistant", content=assistant_message)
+        )
+
+    def _compose_history(self, rounds: int) -> None:
+        total_tokens = sum(
+            self._estimate_tokens(msg.content)
+            for msg in self.history
+        )
+        keep_messages = rounds * 2
+
+        if (
+            total_tokens <= 0.8 * self.max_tokens
+            or len(self.history) <= keep_messages
+        ):
+            return
+
+        old_messages = self.history[:-keep_messages]
+        recent_messages = self.history[-keep_messages:]
+
+        if not old_messages:
+            return
+
+        prompt = self._build_prompt(
+            "compress_history_prompt.md",
+            old_messages,
+        )
+        response = asyncio.run(
+            self.ainvoke(
+                Message(role="user", content=prompt),
+            )
+        )
+        summary = Message(
+            role="system",
+            content=f"以下是之前对话的摘要：\n{response.text}",
+        )
+        self.history = [summary] + recent_messages
+
+    @staticmethod
+    def _estimate_tokens(text: str | None) -> int:
+        if not text:
+            return 0
+
+        total = 0
+
+        for char in text:
+            if char.isspace():
+                continue
+
+            if ord(char) > 127:
+                total += 2
+            else:
+                total += 1
+
+        return total
+
+    def _load_prompt(self, file_name: str) -> str:
+        prompt_path = (
+            Path(__file__).resolve().parent.parent
+            / "prompts"
+            / file_name
+        )
+        return prompt_path.read_text(encoding="utf-8")
+
+    def _build_chat_prompt(self, user_message: str) -> str:
+        template = self._load_prompt("chat_prompt.md")
+        keep_messages = self.rounds * 2
+        history_messages = self.history[:-keep_messages]
+        recent_messages = self.history[-keep_messages:]
+
+        history_text = self._format_messages(history_messages)
+        recent_text = self._format_messages(recent_messages)
+
+        return (
+            template
+            .replace("{history}", history_text)
+            .replace("{input}", user_message)
+            .replace("{recent_chat_record}", recent_text)
+        )
+
+    def _build_prompt(
+        self,
+        file_name: str,
+        messages: list[Message],
+    ) -> str:
+        template = self._load_prompt(file_name)
+        return template.replace(
+            "{history}",
+            self._format_messages(messages),
+        )
+
+    @staticmethod
+    def _format_messages(messages: list[Message]) -> str:
+        lines = [
+            f"{msg.role}: {msg.content}"
+            for msg in messages
+            if msg.content
+        ]
+        return "\n".join(lines)
