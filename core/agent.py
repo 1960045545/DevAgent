@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 import json
+import re
 from dataclasses import replace
 from pathlib import Path
 from typing import Any, Callable, Iterator
@@ -15,6 +16,7 @@ from core.response import ModelResponse
 from core.tool_call import ToolCall
 from core.tool_registry import ToolRegistry
 from core.tool_space import ToolSpec
+from core.user_profile import UserProfile
 from error.request_error import AgentRequestError
 
 
@@ -32,6 +34,11 @@ class Agent:
         max_tokens: int = 1000,
         client: OpenAI | None = None,
         tool_registry: ToolRegistry | None = None,
+        user_profile_path: str | Path | None = None,
+        user_profile_max_items: int = 20,
+        enable_user_profile: bool = True,
+        user_profile_model_id: str | None = None,
+        history_abstract_model_id: str | None = None,
     ) -> None:
         self.base_url = base_url.rstrip("/") if base_url else None
         self.api_key = api_key
@@ -45,6 +52,34 @@ class Agent:
         self.rounds = 3
         self.client = client or self._create_client()
         self.tool_registry = tool_registry or ToolRegistry()
+        self.enable_user_profile = enable_user_profile
+        self.user_profile_model_id = (
+            user_profile_model_id or self.model_id
+        )
+        self.history_abstract_model_id = (
+            history_abstract_model_id or self.model_id
+        )
+
+        default_profile_path = (
+            Path(__file__).resolve().parent.parent
+            / "data"
+            / "user_profile.json"
+        )
+        profile_path = (
+            Path(user_profile_path)
+            if user_profile_path
+            else default_profile_path
+        )
+        self.user_profile = (
+            UserProfile.load(
+                profile_path,
+                max_items=user_profile_max_items,
+            )
+            if enable_user_profile
+            else UserProfile(
+                max_items=user_profile_max_items,
+            )
+        )
 
     def register_tool(
         self,
@@ -60,6 +95,7 @@ class Agent:
         self,
         message: Message,
         options: InvokeOptions | None = None,
+        model_id: str | None = None,
     ) -> ModelResponse:
         if not message:
             raise ValueError("message can not be empty")
@@ -69,6 +105,7 @@ class Agent:
             message,
             options,
             stream=False,
+            model_id=model_id,
         )
 
         response = await asyncio.to_thread(
@@ -101,6 +138,10 @@ class Agent:
                 user_message=user_message,
                 assistant_message=response.text,
             )
+            self._update_user_profile(
+                user_message=user_message,
+                assistant_message=response.text,
+            )
             return response
 
         response = asyncio.run(
@@ -111,6 +152,10 @@ class Agent:
         )
 
         self._append_chat_history(
+            user_message=user_message,
+            assistant_message=response.text,
+        )
+        self._update_user_profile(
             user_message=user_message,
             assistant_message=response.text,
         )
@@ -138,6 +183,10 @@ class Agent:
                 user_message=user_message,
                 assistant_message=response.text,
             )
+            self._update_user_profile(
+                user_message=user_message,
+                assistant_message=response.text,
+            )
             yield response.text
             return
 
@@ -160,6 +209,10 @@ class Agent:
             yield chunk
 
         self._append_chat_history(
+            user_message=user_message,
+            assistant_message="".join(chunks),
+        )
+        self._update_user_profile(
             user_message=user_message,
             assistant_message="".join(chunks),
         )
@@ -292,9 +345,10 @@ class Agent:
         options: InvokeOptions,
         *,
         stream: bool,
+        model_id: str | None = None,
     ) -> dict[str, Any]:
         kwargs: dict[str, Any] = {
-            "model": self.model_id,
+            "model": model_id or self.model_id,
             "messages": [
                 self._serialize_message(message),
             ],
@@ -616,6 +670,7 @@ class Agent:
         response = asyncio.run(
             self.ainvoke(
                 Message(role="user", content=prompt),
+                model_id=self.history_abstract_model_id,
             )
         )
         summary = Message(
@@ -664,7 +719,108 @@ class Agent:
             .replace("{history}", history_text)
             .replace("{input}", user_message)
             .replace("{recent_chat_record}", recent_text)
+            .replace(
+                "{user_profile}",
+                self.user_profile.format(),
+            )
         )
+
+    def _update_user_profile(
+        self,
+        *,
+        user_message: str,
+        assistant_message: str,
+    ) -> None:
+        if not self.enable_user_profile:
+            return
+
+        template = self._load_prompt(
+            "user_profile_update_prompt.md"
+        )
+        prompt = (
+            template
+            .replace(
+                "{user_profile}",
+                self.user_profile.format(),
+            )
+            .replace("{user_message}", user_message)
+            .replace("{assistant_message}", assistant_message)
+        )
+
+        try:
+            response = asyncio.run(
+                self.ainvoke(
+                    Message(role="user", content=prompt),
+                    options=InvokeOptions(
+                        temperature=0,
+                        max_output_tokens=400,
+                    ),
+                    model_id=self.user_profile_model_id,
+                )
+            )
+            update = self._parse_json_object(response.text)
+            additions = self._as_string_list(
+                update.get("add")
+                or update.get("items")
+                or update.get("profile")
+            )
+            removals = self._as_string_list(
+                update.get("remove")
+            )
+
+            self.user_profile.merge(
+                items=additions,
+                remove=removals,
+            )
+            self.user_profile.save()
+        except Exception:
+            # 画像抽取是辅助流程，失败时不能影响正常聊天。
+            return
+
+    @staticmethod
+    def _as_string_list(value: Any) -> list[str]:
+        if isinstance(value, str):
+            return [value]
+
+        if not isinstance(value, list):
+            return []
+
+        return [
+            item
+            for item in value
+            if isinstance(item, str)
+        ]
+
+    @staticmethod
+    def _parse_json_object(text: str) -> dict[str, Any]:
+        if not text:
+            return {}
+
+        cleaned = text.strip()
+        cleaned = re.sub(
+            r"^```(?:json)?\s*|\s*```$",
+            "",
+            cleaned,
+            flags=re.IGNORECASE | re.DOTALL,
+        ).strip()
+
+        try:
+            data = json.loads(cleaned)
+        except json.JSONDecodeError:
+            start = cleaned.find("{")
+            end = cleaned.rfind("}")
+
+            if start < 0 or end <= start:
+                return {}
+
+            try:
+                data = json.loads(
+                    cleaned[start:end + 1]
+                )
+            except json.JSONDecodeError:
+                return {}
+
+        return data if isinstance(data, dict) else {}
 
     def _build_prompt(
         self,

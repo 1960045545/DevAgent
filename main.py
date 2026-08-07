@@ -34,7 +34,11 @@ if __name__ == "__main__":
     agent = agent.Agent(
         base_url=os.getenv("BASE_URL"),
         api_key=os.getenv("API_KEY"),
-        model_id=os.getenv("MODEL_ID"),
+        model_id=os.getenv("LLM_MODEL_ID"),
+        user_profile_model_id=(os.getenv("USER_PROFILE_MODEL_ID")),
+        history_abstract_model_id=os.getenv(
+            "HISTORY_ABSTRACT_MODEL_ID"
+        ),
         max_tokens=3000,
         timeout=120,
     )
