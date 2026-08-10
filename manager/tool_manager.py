@@ -98,6 +98,7 @@ class ToolManager:
                     messages,
                     options,
                     stream=False,
+                    purpose="chat",
                 )
             )
             data = self.llm_manager.response_to_dict(raw_response)

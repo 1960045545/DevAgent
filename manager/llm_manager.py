@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import time
 from typing import Any, Iterator
 
 from openai import OpenAI
@@ -11,6 +12,11 @@ from core.message import Message
 from core.response import ModelResponse
 from core.tool_call import ToolCall
 from error.request_error import AgentRequestError
+from manager.model_provider_manager import (
+    ModelProviderConfig,
+    ModelProviderHealth,
+    ModelPurpose,
+)
 
 
 class LLMManager:
@@ -22,36 +28,58 @@ class LLMManager:
         model_id: str | None,
         timeout: float = 60.0,
         max_retries: int = 3,
+        retry_interval: float = 5.0,
+        cooldown_seconds: float = 30.0,
         default_headers: dict[str, str] | None = None,
         client: OpenAI | None = None,
+        providers: list[ModelProviderConfig] | None = None,
     ) -> None:
-        self.base_url = base_url.rstrip("/") if base_url else None
-        self.api_key = api_key
-        self.model_id = model_id
+        self.providers = providers or [
+            ModelProviderConfig(
+                name="default",
+                base_url=base_url,
+                api_key=api_key,
+                chat_model_id=model_id,
+                history_model_id=model_id,
+                profile_model_id=model_id,
+            )
+        ]
+        primary_provider = self.providers[0]
+        self.base_url = (
+            primary_provider.base_url.rstrip("/")
+            if primary_provider.base_url
+            else None
+        )
+        self.api_key = primary_provider.api_key
+        self.model_id = primary_provider.chat_model_id
         self.timeout = timeout
-        self.max_retries = max_retries
+        self.max_retries = max(1, max_retries)
+        self.retry_interval = retry_interval
+        self.cooldown_seconds = cooldown_seconds
         self.default_headers = default_headers or {}
-        self.client = client or self._create_client()
+        self.clients = self._create_clients(client)
+        self.client = (
+            client
+            or self.clients[primary_provider.name]
+        )
 
     async def ainvoke(
         self,
         message: Message,
         options: InvokeOptions | None = None,
         model_id: str | None = None,
+        purpose: ModelPurpose = "chat",
     ) -> ModelResponse:
         if not message:
             raise ValueError("message can not be empty")
 
         options = options or InvokeOptions()
-        kwargs = self.build_chat_completion_kwargs(
-            message,
-            options,
-            stream=False,
-            model_id=model_id,
-        )
         response = await asyncio.to_thread(
-            self.client.chat.completions.create,
-            **kwargs,
+            self._create_completion_with_fallback,
+            [self.serialize_message(message)],
+            options,
+            model_id,
+            purpose,
         )
 
         return self.parse_chat_response(
@@ -63,12 +91,14 @@ class LLMManager:
         message: Message,
         options: InvokeOptions | None = None,
         model_id: str | None = None,
+        purpose: ModelPurpose = "chat",
     ) -> ModelResponse:
         return asyncio.run(
             self.ainvoke(
                 message,
                 options=options,
                 model_id=model_id,
+                purpose=purpose,
             )
         )
 
@@ -77,21 +107,15 @@ class LLMManager:
         message: Message,
         options: InvokeOptions | None = None,
         model_id: str | None = None,
+        purpose: ModelPurpose = "chat",
     ) -> Iterator[str]:
         options = options or InvokeOptions()
-        kwargs = self.build_chat_completion_kwargs(
-            message,
+        yield from self._stream_with_fallback(
+            [self.serialize_message(message)],
             options,
-            stream=True,
-            model_id=model_id,
+            model_id,
+            purpose,
         )
-        stream = self.client.chat.completions.create(**kwargs)
-
-        for event in stream:
-            chunk = self.stream_event_content(event)
-
-            if chunk:
-                yield chunk
 
     def create_chat_completion(
         self,
@@ -100,26 +124,235 @@ class LLMManager:
         *,
         stream: bool,
         model_id: str | None = None,
+        purpose: ModelPurpose = "chat",
     ) -> Any:
-        kwargs = self.build_chat_completion_kwargs_for_messages(
+        if stream:
+            return self._stream_with_fallback(
+                messages,
+                options or InvokeOptions(),
+                model_id,
+                purpose,
+            )
+
+        return self._create_completion_with_fallback(
             messages,
             options or InvokeOptions(),
-            stream=stream,
-            model_id=model_id,
+            model_id,
+            purpose,
         )
-        return self.client.chat.completions.create(**kwargs)
 
-    def _create_client(self) -> OpenAI:
-        kwargs: dict[str, Any] = {
-            "api_key": self.api_key,
-            "timeout": self.timeout,
-            "max_retries": self.max_retries,
+    def _create_clients(
+        self,
+        client: OpenAI | None,
+    ) -> dict[str, OpenAI]:
+        if client is not None:
+            return {
+                provider.name: client
+                for provider in self.providers
+            }
+
+        return {
+            provider.name: self._create_client(provider)
+            for provider in self.providers
         }
 
-        if self.base_url:
-            kwargs["base_url"] = self.base_url
+    def _create_client(
+        self,
+        provider: ModelProviderConfig,
+    ) -> OpenAI:
+        kwargs: dict[str, Any] = {
+            "api_key": provider.api_key or "ollama",
+            "timeout": self.timeout,
+            "max_retries": 0,
+        }
+
+        if provider.base_url:
+            kwargs["base_url"] = provider.base_url.rstrip("/")
 
         return OpenAI(**kwargs)
+
+    def _create_completion_with_fallback(
+        self,
+        messages: list[dict[str, Any]],
+        options: InvokeOptions,
+        model_id: str | None,
+        purpose: ModelPurpose,
+    ) -> Any:
+        last_error: BaseException | None = None
+
+        for provider in self.providers:
+            if not ModelProviderHealth.can_try(provider.name):
+                continue
+
+            attempts = (
+                1
+                if ModelProviderHealth.needs_probe(provider.name)
+                else self.max_retries
+            )
+
+            try:
+                response = self._create_completion_for_provider(
+                    provider,
+                    messages,
+                    options,
+                    stream=False,
+                    model_id=model_id,
+                    purpose=purpose,
+                    attempts=attempts,
+                )
+                ModelProviderHealth.record_success(provider.name)
+                return response
+            except Exception as exc:
+                if not self._is_retryable_exception(exc):
+                    raise
+
+                last_error = exc
+                ModelProviderHealth.mark_unavailable(
+                    provider.name,
+                    error=exc,
+                    cooldown_seconds=self.cooldown_seconds,
+                )
+
+        raise AgentRequestError(
+            "All model providers are unavailable",
+            retryable=True,
+        ) from last_error
+
+    def _create_completion_for_provider(
+        self,
+        provider: ModelProviderConfig,
+        messages: list[dict[str, Any]],
+        options: InvokeOptions,
+        *,
+        stream: bool,
+        model_id: str | None,
+        purpose: ModelPurpose,
+        attempts: int,
+    ) -> Any:
+        last_error: BaseException | None = None
+
+        for attempt in range(1, attempts + 1):
+            try:
+                kwargs = self.build_chat_completion_kwargs_for_messages(
+                    messages,
+                    options,
+                    stream=stream,
+                    model_id=provider.model_for(
+                        purpose,
+                        override_model_id=model_id,
+                    ),
+                )
+                return self.clients[
+                    provider.name
+                ].chat.completions.create(**kwargs)
+            except Exception as exc:
+                if not self._is_retryable_exception(exc):
+                    raise
+
+                last_error = exc
+                ModelProviderHealth.record_failure(
+                    provider.name,
+                    attempt=attempt,
+                    error=exc,
+                )
+
+                if attempt < attempts:
+                    time.sleep(self.retry_interval)
+
+        if last_error is None:
+            raise AgentRequestError(
+                f"Provider has no available model: {provider.name}",
+                retryable=True,
+            )
+
+        raise last_error
+
+    def _stream_with_fallback(
+        self,
+        messages: list[dict[str, Any]],
+        options: InvokeOptions,
+        model_id: str | None,
+        purpose: ModelPurpose,
+    ) -> Iterator[str]:
+        last_error: BaseException | None = None
+
+        for provider in self.providers:
+            if not ModelProviderHealth.can_try(provider.name):
+                continue
+
+            attempts = (
+                1
+                if ModelProviderHealth.needs_probe(provider.name)
+                else self.max_retries
+            )
+
+            try:
+                first_chunk, stream = self._open_stream_for_provider(
+                    provider,
+                    messages,
+                    options,
+                    model_id=model_id,
+                    purpose=purpose,
+                    attempts=attempts,
+                )
+            except Exception as exc:
+                if not self._is_retryable_exception(exc):
+                    raise
+
+                last_error = exc
+                ModelProviderHealth.mark_unavailable(
+                    provider.name,
+                    error=exc,
+                    cooldown_seconds=self.cooldown_seconds,
+                )
+                continue
+
+            ModelProviderHealth.record_success(provider.name)
+            yield first_chunk
+
+            for event in stream:
+                chunk = self.stream_event_content(event)
+
+                if chunk:
+                    yield chunk
+
+            return
+
+        raise AgentRequestError(
+            "All model providers are unavailable",
+            retryable=True,
+        ) from last_error
+
+    def _open_stream_for_provider(
+        self,
+        provider: ModelProviderConfig,
+        messages: list[dict[str, Any]],
+        options: InvokeOptions,
+        *,
+        model_id: str | None,
+        purpose: ModelPurpose,
+        attempts: int,
+    ) -> tuple[str, Any]:
+        stream = self._create_completion_for_provider(
+            provider,
+            messages,
+            options,
+            stream=True,
+            model_id=model_id,
+            purpose=purpose,
+            attempts=attempts,
+        )
+
+        for event in stream:
+            chunk = self.stream_event_content(event)
+
+            if chunk:
+                return chunk, stream
+
+        raise AgentRequestError(
+            f"Provider stream returned no content: {provider.name}",
+            retryable=True,
+        )
 
     def build_chat_completion_kwargs(
         self,
@@ -191,6 +424,28 @@ class LLMManager:
             kwargs["extra_headers"] = extra_headers
 
         return kwargs
+
+    @staticmethod
+    def _is_retryable_exception(exc: BaseException) -> bool:
+        retryable = getattr(exc, "retryable", None)
+
+        if retryable is not None:
+            return bool(retryable)
+
+        status_code = getattr(exc, "status_code", None)
+        response = getattr(exc, "response", None)
+
+        if status_code is None and response is not None:
+            status_code = getattr(response, "status_code", None)
+
+        if status_code is None:
+            return True
+
+        return (
+            status_code == 408
+            or status_code == 429
+            or status_code >= 500
+        )
 
     @staticmethod
     def assistant_message_from_response(

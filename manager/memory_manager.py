@@ -70,6 +70,7 @@ class MemoryManager:
             response = self.llm_manager.invoke(
                 Message(role="user", content=prompt),
                 model_id=self.history_abstract_model_id,
+                purpose="history",
             )
         except Exception:
             return

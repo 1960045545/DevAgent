@@ -1,6 +1,7 @@
 from core import agent
 from core.tool_space import ToolSpec
 from dotenv import load_dotenv
+from manager.model_provider_manager import ModelProviderConfig
 import os
 
 load_dotenv()
@@ -30,15 +31,77 @@ add_tool = ToolSpec(
 )
 
 
+def build_model_providers() -> list[ModelProviderConfig]:
+    providers: list[ModelProviderConfig] = []
+
+    if (
+        os.getenv("SILICON_BASE_URL")
+        and os.getenv("SILICON_LLM_MODEL_ID")
+    ):
+        providers.append(
+            ModelProviderConfig(
+                name="silicon",
+                base_url=os.getenv("SILICON_BASE_URL"),
+                api_key=os.getenv("SILICON_API_KEY"),
+                chat_model_id=os.getenv("SILICON_LLM_MODEL_ID"),
+                history_model_id=os.getenv(
+                    "SILICON_HISTORY_ABSTRACT_MODEL_ID"
+                ),
+                profile_model_id=os.getenv(
+                    "SILICON_USER_PROFILE_MODEL_ID"
+                ),
+            )
+        )
+
+    if (
+        os.getenv("BAI_LIAN_BASE_URL")
+        and os.getenv("BAI_LIAN_LLM_MODEL_ID")
+    ):
+        providers.append(
+            ModelProviderConfig(
+                name="bailian",
+                base_url=os.getenv("BAI_LIAN_BASE_URL"),
+                api_key=os.getenv("BAI_LIAN_API_KEY"),
+                chat_model_id=os.getenv("BAI_LIAN_LLM_MODEL_ID"),
+                history_model_id=os.getenv(
+                    "BAI_LIAN_HISTORY_ABSTRACT_MODEL_ID"
+                ),
+                profile_model_id=os.getenv(
+                    "BAI_LIAN_USER_PROFILE_MODEL_ID"
+                ),
+            )
+        )
+
+    if (
+        os.getenv("OLLAMA_BASE_URL")
+        and os.getenv("OLLAMA_MODEL_ID")
+    ):
+        ollama_model_id = os.getenv("OLLAMA_MODEL_ID")
+        providers.append(
+            ModelProviderConfig(
+                name="ollama",
+                base_url=os.getenv("OLLAMA_BASE_URL"),
+                api_key=os.getenv("OLLAMA_API_KEY"),
+                chat_model_id=ollama_model_id,
+                history_model_id=ollama_model_id,
+                profile_model_id=ollama_model_id,
+            )
+        )
+
+    return providers
+
+
 if __name__ == "__main__":
+    model_providers = build_model_providers()
+
     agent = agent.Agent(
         base_url=os.getenv("BASE_URL"),
         api_key=os.getenv("API_KEY"),
         model_id=os.getenv("LLM_MODEL_ID"),
-        user_profile_model_id=(os.getenv("USER_PROFILE_MODEL_ID")),
-        history_abstract_model_id=os.getenv(
-            "HISTORY_ABSTRACT_MODEL_ID"
-        ),
+        providers=model_providers or None,
+        max_retries=3,
+        retry_interval=5,
+        cooldown_seconds=30,
         max_tokens=3000,
         timeout=120,
     )

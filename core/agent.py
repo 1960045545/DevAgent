@@ -12,6 +12,7 @@ from core.tool_registry import ToolRegistry
 from core.tool_space import ToolSpec
 from manager.llm_manager import LLMManager
 from manager.memory_manager import MemoryManager
+from manager.model_provider_manager import ModelProviderConfig
 from manager.prompt_manager import PromptManager
 from manager.tool_manager import ToolManager
 from manager.user_profile_manager import UserProfileManager
@@ -26,10 +27,13 @@ class Agent:
         model_id: str | None,
         timeout: float = 60.0,
         max_retries: int = 3,
+        retry_interval: float = 5.0,
+        cooldown_seconds: float = 30.0,
         retry_backoff: float = 1.5,
         default_headers: dict[str, str] | None = None,
         max_tokens: int = 1000,
         client: OpenAI | None = None,
+        providers: list[ModelProviderConfig] | None = None,
         tool_registry: ToolRegistry | None = None,
         user_profile_path: str | Path | None = None,
         user_profile_max_items: int = 20,
@@ -45,8 +49,11 @@ class Agent:
             model_id=model_id,
             timeout=timeout,
             max_retries=max_retries,
+            retry_interval=retry_interval,
+            cooldown_seconds=cooldown_seconds,
             default_headers=default_headers,
             client=client,
+            providers=providers,
         )
         self.prompt_manager = PromptManager(prompt_dir)
         self.memory_manager = MemoryManager(
@@ -54,14 +61,12 @@ class Agent:
             rounds=3,
             prompt_manager=self.prompt_manager,
             llm_manager=self.llm_manager,
-            history_abstract_model_id=(
-                history_abstract_model_id or model_id
-            ),
+            history_abstract_model_id=history_abstract_model_id,
         )
         self.profile_manager = UserProfileManager(
             prompt_manager=self.prompt_manager,
             llm_manager=self.llm_manager,
-            model_id=user_profile_model_id or model_id,
+            model_id=user_profile_model_id,
             profile_path=user_profile_path,
             max_items=user_profile_max_items,
             enabled=enable_user_profile,

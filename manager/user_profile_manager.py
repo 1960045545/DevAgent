@@ -25,7 +25,7 @@ class UserProfileManager:
     ) -> None:
         self.prompt_manager = prompt_manager
         self.llm_manager = llm_manager
-        self.model_id = model_id or llm_manager.model_id
+        self.model_id = model_id
         self.enabled = enabled
 
         default_profile_path = (
@@ -78,6 +78,7 @@ class UserProfileManager:
                     max_output_tokens=400,
                 ),
                 model_id=self.model_id,
+                purpose="profile",
             )
             update = self.parse_json_object(response.text)
             additions = self.as_string_list(
