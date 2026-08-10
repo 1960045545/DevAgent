@@ -4,9 +4,13 @@ import threading
 import time
 from dataclasses import dataclass
 from typing import Literal
+import logging
 
 
 ModelPurpose = Literal["chat", "history", "profile"]
+
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -68,7 +72,16 @@ class ModelProviderHealth:
     @classmethod
     def can_try(cls, name: str) -> bool:
         with cls._lock:
-            return not cls.get_state(name).in_cooldown()
+            state = cls.get_state(name)
+            can_try = not state.in_cooldown()
+
+            if can_try and state.unavailable_until > 0:
+                logger.info(
+                    "provider cooldown ended name=%s",
+                    name,
+                )
+
+            return can_try
 
     @classmethod
     def needs_probe(cls, name: str) -> bool:
@@ -87,6 +100,12 @@ class ModelProviderHealth:
             state = cls.get_state(name)
             state.failures = attempt
             state.last_error = str(error)
+            logger.warning(
+                "provider failure recorded name=%s attempt=%d error=%s",
+                name,
+                attempt,
+                error,
+            )
 
     @classmethod
     def mark_unavailable(
@@ -102,6 +121,12 @@ class ModelProviderHealth:
                 time.monotonic() + cooldown_seconds
             )
             state.last_error = str(error)
+            logger.warning(
+                "provider marked unavailable name=%s cooldown=%ss error=%s",
+                name,
+                cooldown_seconds,
+                error,
+            )
 
     @classmethod
     def record_success(cls, name: str) -> None:
@@ -110,3 +135,7 @@ class ModelProviderHealth:
             state.failures = 0
             state.unavailable_until = 0.0
             state.last_error = None
+            logger.info(
+                "provider state cleared name=%s",
+                name,
+            )

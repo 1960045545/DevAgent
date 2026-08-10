@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 import json
+import logging
 from dataclasses import replace
 from typing import Any, Callable
 
@@ -13,6 +14,9 @@ from core.tool_registry import ToolRegistry
 from core.tool_space import ToolSpec
 from error.request_error import AgentRequestError
 from manager.llm_manager import LLMManager
+
+
+logger = logging.getLogger(__name__)
 
 
 class ToolManager:
@@ -30,6 +34,7 @@ class ToolManager:
         spec: ToolSpec,
         handler: Callable[..., Any],
     ) -> None:
+        logger.info("register tool name=%s", spec.name)
         self.tool_registry.register(
             spec,
             handler,
@@ -81,6 +86,11 @@ class ToolManager:
                 retryable=False,
             )
 
+        logger.info(
+            "tool chat start tool_count=%d",
+            len(options.tools or []),
+        )
+
         messages: list[dict[str, Any]] = [
             {
                 "role": "system",
@@ -105,6 +115,7 @@ class ToolManager:
             response = self.llm_manager.parse_chat_response(data)
 
             if not response.tool_calls:
+                logger.info("tool chat finished without tool call")
                 return response
 
             messages.append(
@@ -118,6 +129,11 @@ class ToolManager:
                         retryable=False,
                     )
 
+                logger.info(
+                    "tool call requested name=%s id=%s",
+                    tool_call.name,
+                    tool_call.id,
+                )
                 messages.append(
                     {
                         "role": "tool",
@@ -159,6 +175,11 @@ class ToolManager:
             )
 
         try:
+            logger.debug(
+                "executing tool name=%s arguments=%s",
+                tool_call.name,
+                tool_call.arguments,
+            )
             if isinstance(tool_call.arguments, dict):
                 result = handler(**tool_call.arguments)
             else:
@@ -168,10 +189,18 @@ class ToolManager:
                 result = asyncio.run(result)
 
         except Exception as exc:
+            logger.exception(
+                "tool execution failed name=%s",
+                tool_call.name,
+            )
             result = {
                 "error": str(exc),
             }
 
+        logger.debug(
+            "tool execution finished name=%s",
+            tool_call.name,
+        )
         return self._stringify_tool_result(result)
 
     @staticmethod

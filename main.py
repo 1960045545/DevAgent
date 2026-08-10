@@ -1,10 +1,12 @@
 from core import agent
 from core.tool_space import ToolSpec
 from dotenv import load_dotenv
+from manager.log_manager import configure_logging
 from manager.model_provider_manager import ModelProviderConfig
 import os
 
 load_dotenv()
+configure_logging()
 
 
 def add(a: int, b: int) -> int:

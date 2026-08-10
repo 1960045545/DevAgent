@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 from typing import Any, Callable, Iterator
 
@@ -16,6 +17,9 @@ from manager.model_provider_manager import ModelProviderConfig
 from manager.prompt_manager import PromptManager
 from manager.tool_manager import ToolManager
 from manager.user_profile_manager import UserProfileManager
+
+
+logger = logging.getLogger(__name__)
 
 
 class Agent:
@@ -84,6 +88,11 @@ class Agent:
         self.default_headers = self.llm_manager.default_headers
         self.client = self.llm_manager.client
         self.tool_registry = self.tool_manager.tool_registry
+        logger.info(
+            "agent initialized model=%s providers=%s",
+            self.model_id,
+            [provider.name for provider in (providers or [])] or ["default"],
+        )
 
     @property
     def history(self) -> list[Message]:
@@ -148,22 +157,32 @@ class Agent:
         user_message: str,
         options: InvokeOptions | None = None,
     ) -> ModelResponse:
+        logger.info("chat start")
         self.memory_manager.compress_if_needed()
-        prompt = self._build_chat_prompt(user_message)
+        system_prompt = self._build_chat_system_prompt()
         options = self.tool_manager.merge_options(
             options or InvokeOptions()
         )
 
         if options.tools:
+            logger.info("chat route=tool")
             response = self.tool_manager.chat_with_tools(
-                prompt=prompt,
+                prompt=system_prompt,
                 user_message=user_message,
                 options=options,
             )
         else:
-            response = self.llm_manager.invoke(
-                Message(role="user", content=prompt),
+            logger.info("chat route=normal")
+            response = self.llm_manager.invoke_messages(
+                [
+                    Message(
+                        role="system",
+                        content=system_prompt,
+                    ).to_dict(),
+                    Message(role="user", content=user_message).to_dict(),
+                ],
                 options=options,
+                purpose="chat",
             )
 
         self._finish_chat_turn(
@@ -177,15 +196,17 @@ class Agent:
         user_message: str,
         options: InvokeOptions | None = None,
     ) -> Iterator[str]:
+        logger.info("stream_chat start")
         self.memory_manager.compress_if_needed()
-        prompt = self._build_chat_prompt(user_message)
+        system_prompt = self._build_chat_system_prompt()
         options = self.tool_manager.merge_options(
             options or InvokeOptions()
         )
 
         if options.tools:
+            logger.info("stream_chat route=tool")
             response = self.tool_manager.chat_with_tools(
-                prompt=prompt,
+                prompt=system_prompt,
                 user_message=user_message,
                 options=options,
             )
@@ -198,9 +219,17 @@ class Agent:
 
         chunks: list[str] = []
 
-        for chunk in self.llm_manager.stream(
-            Message(role="user", content=prompt),
+        logger.info("stream_chat route=normal")
+        for chunk in self.llm_manager.stream_messages(
+            [
+                Message(
+                    role="system",
+                    content=system_prompt,
+                ).to_dict(),
+                Message(role="user", content=user_message).to_dict(),
+            ],
             options=options,
+            purpose="chat",
         ):
             chunks.append(chunk)
             yield chunk
@@ -210,16 +239,19 @@ class Agent:
             assistant_message="".join(chunks),
         )
 
-    def _build_chat_prompt(self, user_message: str) -> str:
+    def _build_chat_system_prompt(self) -> str:
         history_text, recent_text = (
             self.memory_manager.get_prompt_texts()
         )
-        return self.prompt_manager.build_chat_prompt(
-            user_message=user_message,
+        return self.prompt_manager.build_chat_system_prompt(
             history=history_text,
             recent_chat_record=recent_text,
             user_profile=self.profile_manager.format(),
         )
+
+    def _build_chat_prompt(self, user_message: str) -> str:
+        system_prompt = self._build_chat_system_prompt()
+        return f"{system_prompt}\n\n用户最新问题：\n{user_message}"
 
     def _finish_chat_turn(
         self,
@@ -227,6 +259,7 @@ class Agent:
         user_message: str,
         assistant_message: str,
     ) -> None:
+        logger.debug("finish chat turn")
         self.memory_manager.append_chat(
             user_message=user_message,
             assistant_message=assistant_message,

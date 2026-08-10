@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import time
 from typing import Any, Iterator
 
@@ -17,6 +18,9 @@ from manager.model_provider_manager import (
     ModelProviderHealth,
     ModelPurpose,
 )
+
+
+logger = logging.getLogger(__name__)
 
 
 class LLMManager:
@@ -62,6 +66,11 @@ class LLMManager:
             client
             or self.clients[primary_provider.name]
         )
+        logger.info(
+            "initialized llm manager providers=%s primary=%s",
+            [provider.name for provider in self.providers],
+            primary_provider.name,
+        )
 
     async def ainvoke(
         self,
@@ -93,6 +102,11 @@ class LLMManager:
         model_id: str | None = None,
         purpose: ModelPurpose = "chat",
     ) -> ModelResponse:
+        logger.debug(
+            "invoke single-message purpose=%s model_override=%s",
+            purpose,
+            model_id,
+        )
         return asyncio.run(
             self.ainvoke(
                 message,
@@ -102,6 +116,30 @@ class LLMManager:
             )
         )
 
+    def invoke_messages(
+        self,
+        messages: list[dict[str, Any]],
+        options: InvokeOptions | None = None,
+        model_id: str | None = None,
+        purpose: ModelPurpose = "chat",
+    ) -> ModelResponse:
+        logger.debug(
+            "invoke messages purpose=%s model_override=%s count=%d",
+            purpose,
+            model_id,
+            len(messages),
+        )
+        options = options or InvokeOptions()
+        response = self._create_completion_with_fallback(
+            messages,
+            options,
+            model_id,
+            purpose,
+        )
+        return self.parse_chat_response(
+            self.response_to_dict(response)
+        )
+
     def stream(
         self,
         message: Message,
@@ -109,10 +147,35 @@ class LLMManager:
         model_id: str | None = None,
         purpose: ModelPurpose = "chat",
     ) -> Iterator[str]:
+        logger.debug(
+            "stream single-message purpose=%s model_override=%s",
+            purpose,
+            model_id,
+        )
         options = options or InvokeOptions()
         yield from self._stream_with_fallback(
             [self.serialize_message(message)],
             options,
+            model_id,
+            purpose,
+        )
+
+    def stream_messages(
+        self,
+        messages: list[dict[str, Any]],
+        options: InvokeOptions | None = None,
+        model_id: str | None = None,
+        purpose: ModelPurpose = "chat",
+    ) -> Iterator[str]:
+        logger.debug(
+            "stream messages purpose=%s model_override=%s count=%d",
+            purpose,
+            model_id,
+            len(messages),
+        )
+        yield from self._stream_with_fallback(
+            messages,
+            options or InvokeOptions(),
             model_id,
             purpose,
         )
@@ -182,12 +245,26 @@ class LLMManager:
 
         for provider in self.providers:
             if not ModelProviderHealth.can_try(provider.name):
+                logger.info(
+                    "skip provider cooldown name=%s purpose=%s",
+                    provider.name,
+                    purpose,
+                )
                 continue
 
             attempts = (
                 1
                 if ModelProviderHealth.needs_probe(provider.name)
                 else self.max_retries
+            )
+            model_name = provider.model_for(purpose, override_model_id=model_id)
+            logger.info(
+                "try provider name=%s purpose=%s stream=%s attempts=%d model=%s",
+                provider.name,
+                purpose,
+                False,
+                attempts,
+                model_name,
             )
 
             try:
@@ -201,9 +278,19 @@ class LLMManager:
                     attempts=attempts,
                 )
                 ModelProviderHealth.record_success(provider.name)
+                logger.info(
+                    "provider success name=%s purpose=%s",
+                    provider.name,
+                    purpose,
+                )
                 return response
             except Exception as exc:
                 if not self._is_retryable_exception(exc):
+                    logger.exception(
+                        "non-retryable error provider=%s purpose=%s",
+                        provider.name,
+                        purpose,
+                    )
                     raise
 
                 last_error = exc
@@ -211,6 +298,13 @@ class LLMManager:
                     provider.name,
                     error=exc,
                     cooldown_seconds=self.cooldown_seconds,
+                )
+                logger.warning(
+                    "provider unavailable name=%s purpose=%s cooldown=%ss error=%s",
+                    provider.name,
+                    purpose,
+                    self.cooldown_seconds,
+                    exc,
                 )
 
         raise AgentRequestError(
@@ -247,6 +341,12 @@ class LLMManager:
                 ].chat.completions.create(**kwargs)
             except Exception as exc:
                 if not self._is_retryable_exception(exc):
+                    logger.exception(
+                        "non-retryable provider failure name=%s purpose=%s attempt=%d",
+                        provider.name,
+                        purpose,
+                        attempt,
+                    )
                     raise
 
                 last_error = exc
@@ -254,6 +354,15 @@ class LLMManager:
                     provider.name,
                     attempt=attempt,
                     error=exc,
+                )
+                logger.warning(
+                    "provider attempt failed name=%s purpose=%s attempt=%d/%d model=%s error=%s",
+                    provider.name,
+                    purpose,
+                    attempt,
+                    attempts,
+                    provider.model_for(purpose, override_model_id=model_id),
+                    exc,
                 )
 
                 if attempt < attempts:
@@ -278,12 +387,26 @@ class LLMManager:
 
         for provider in self.providers:
             if not ModelProviderHealth.can_try(provider.name):
+                logger.info(
+                    "skip provider cooldown name=%s purpose=%s",
+                    provider.name,
+                    purpose,
+                )
                 continue
 
             attempts = (
                 1
                 if ModelProviderHealth.needs_probe(provider.name)
                 else self.max_retries
+            )
+            model_name = provider.model_for(purpose, override_model_id=model_id)
+            logger.info(
+                "try provider name=%s purpose=%s stream=%s attempts=%d model=%s",
+                provider.name,
+                purpose,
+                True,
+                attempts,
+                model_name,
             )
 
             try:
@@ -297,6 +420,11 @@ class LLMManager:
                 )
             except Exception as exc:
                 if not self._is_retryable_exception(exc):
+                    logger.exception(
+                        "non-retryable stream failure name=%s purpose=%s",
+                        provider.name,
+                        purpose,
+                    )
                     raise
 
                 last_error = exc
@@ -305,9 +433,21 @@ class LLMManager:
                     error=exc,
                     cooldown_seconds=self.cooldown_seconds,
                 )
+                logger.warning(
+                    "provider stream unavailable name=%s purpose=%s cooldown=%ss error=%s",
+                    provider.name,
+                    purpose,
+                    self.cooldown_seconds,
+                    exc,
+                )
                 continue
 
             ModelProviderHealth.record_success(provider.name)
+            logger.info(
+                "provider stream success first_chunk name=%s purpose=%s",
+                provider.name,
+                purpose,
+            )
             yield first_chunk
 
             for event in stream:

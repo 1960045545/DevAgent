@@ -1,7 +1,11 @@
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 from typing import Any
+
+
+logger = logging.getLogger(__name__)
 
 
 class PromptManager:
@@ -17,6 +21,10 @@ class PromptManager:
 
     def load(self, file_name: str) -> str:
         prompt_path = self.prompt_dir / file_name
+        logger.debug(
+            "loading prompt template file=%s",
+            prompt_path,
+        )
         return prompt_path.read_text(encoding="utf-8")
 
     def render(
@@ -24,6 +32,11 @@ class PromptManager:
         file_name: str,
         **context: Any,
     ) -> str:
+        logger.debug(
+            "rendering prompt file=%s keys=%s",
+            file_name,
+            sorted(context.keys()),
+        )
         prompt = self.load(file_name)
 
         for key, value in context.items():
@@ -34,6 +47,20 @@ class PromptManager:
 
         return prompt
 
+    def build_chat_system_prompt(
+        self,
+        *,
+        history: str,
+        recent_chat_record: str,
+        user_profile: str,
+    ) -> str:
+        return self.render(
+            "chat_prompt.md",
+            history=history,
+            recent_chat_record=recent_chat_record,
+            user_profile=user_profile,
+        )
+
     def build_chat_prompt(
         self,
         *,
@@ -42,12 +69,15 @@ class PromptManager:
         recent_chat_record: str,
         user_profile: str,
     ) -> str:
-        return self.render(
-            "chat_prompt.md",
-            input=user_message,
+        system_prompt = self.build_chat_system_prompt(
             history=history,
             recent_chat_record=recent_chat_record,
             user_profile=user_profile,
+        )
+
+        return (
+            f"{system_prompt}\n\n"
+            f"用户最新问题：\n{user_message}"
         )
 
     def build_compress_history_prompt(

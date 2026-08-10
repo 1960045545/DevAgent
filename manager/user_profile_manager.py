@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import re
 from pathlib import Path
 from typing import Any
@@ -10,6 +11,9 @@ from core.message import Message
 from core.user_profile import UserProfile
 from manager.llm_manager import LLMManager
 from manager.prompt_manager import PromptManager
+
+
+logger = logging.getLogger(__name__)
 
 
 class UserProfileManager:
@@ -27,6 +31,7 @@ class UserProfileManager:
         self.llm_manager = llm_manager
         self.model_id = model_id
         self.enabled = enabled
+        logger.info("user profile manager enabled=%s", enabled)
 
         default_profile_path = (
             Path(__file__).resolve().parent.parent
@@ -62,6 +67,7 @@ class UserProfileManager:
         if not self.enabled:
             return
 
+        logger.info("user profile update start")
         prompt = (
             self.prompt_manager.build_user_profile_update_prompt(
                 user_profile=self.format(),
@@ -81,6 +87,8 @@ class UserProfileManager:
                 purpose="profile",
             )
             update = self.parse_json_object(response.text)
+            if not update:
+                logger.warning("user profile update returned empty json")
             additions = self.as_string_list(
                 update.get("add")
                 or update.get("items")
@@ -95,7 +103,14 @@ class UserProfileManager:
                 remove=removals,
             )
             self.profile.save()
+            logger.info(
+                "user profile update finished add=%d remove=%d total=%d",
+                len(additions),
+                len(removals),
+                len(self.profile.items),
+            )
         except Exception:
+            logger.exception("user profile update failed")
             return
 
     @staticmethod

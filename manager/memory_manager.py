@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from typing import TYPE_CHECKING
 
 from core.message import Message
@@ -7,6 +8,9 @@ from core.message import Message
 if TYPE_CHECKING:
     from manager.llm_manager import LLMManager
     from manager.prompt_manager import PromptManager
+
+
+logger = logging.getLogger(__name__)
 
 
 class MemoryManager:
@@ -32,6 +36,7 @@ class MemoryManager:
         user_message: str,
         assistant_message: str,
     ) -> None:
+        logger.debug("append chat history")
         self.history.append(
             Message(role="user", content=user_message)
         )
@@ -50,6 +55,12 @@ class MemoryManager:
             total_tokens <= 0.8 * self.max_tokens
             or len(self.history) <= keep_messages
         ):
+            logger.debug(
+                "skip history compression total_tokens=%d max_tokens=%d history_len=%d",
+                total_tokens,
+                self.max_tokens,
+                len(self.history),
+            )
             return
 
         old_messages = self.history[:-keep_messages]
@@ -60,8 +71,20 @@ class MemoryManager:
             or self.prompt_manager is None
             or self.llm_manager is None
         ):
+            logger.warning(
+                "skip history compression missing dependency old_messages=%d prompt_manager=%s llm_manager=%s",
+                len(old_messages),
+                self.prompt_manager is not None,
+                self.llm_manager is not None,
+            )
             return
 
+        logger.info(
+            "history compression start total_tokens=%d old_messages=%d recent_messages=%d",
+            total_tokens,
+            len(old_messages),
+            len(recent_messages),
+        )
         prompt = self.prompt_manager.build_compress_history_prompt(
             history=self.format_messages(old_messages),
         )
@@ -73,6 +96,7 @@ class MemoryManager:
                 purpose="history",
             )
         except Exception:
+            logger.exception("history compression failed")
             return
 
         summary = Message(
@@ -80,6 +104,10 @@ class MemoryManager:
             content=f"以下是之前对话的摘要：\n{response.text}",
         )
         self.history = [summary] + recent_messages
+        logger.info(
+            "history compression finished summary_chars=%d",
+            len(response.text),
+        )
 
     def get_prompt_texts(self) -> tuple[str, str]:
         keep_messages = self.rounds * 2
