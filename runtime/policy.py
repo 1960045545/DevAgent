@@ -7,3 +7,5 @@ class RuntimePolicy:
     raise_on_error: bool = False
     persist_task_state: bool = False
     timeout_seconds: float | None = None
+    stream_batch_chars: int = 12
+    stream_batch_seconds: float = 0.1

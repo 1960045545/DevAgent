@@ -9,5 +9,6 @@ class ChatResult:
     success: bool
     events: list[ChatEvent]
     model: str | None
-    token_usage: int
+    provider_name: str | None = None
+    token_usage: int | None = None
     error: str | None = None

@@ -61,6 +61,8 @@ class LLMManager:
         self.retry_interval = retry_interval
         self.cooldown_seconds = cooldown_seconds
         self.default_headers = default_headers or {}
+        self.last_success_provider_name: str | None = None
+        self.last_success_model_id: str | None = None
         self.clients = self._create_clients(client)
         self.client = (
             client
@@ -241,6 +243,8 @@ class LLMManager:
         model_id: str | None,
         purpose: ModelPurpose,
     ) -> Any:
+        self.last_success_provider_name = None
+        self.last_success_model_id = None
         last_error: BaseException | None = None
 
         for provider in self.providers:
@@ -278,6 +282,11 @@ class LLMManager:
                     attempts=attempts,
                 )
                 ModelProviderHealth.record_success(provider.name)
+                self.last_success_provider_name = provider.name
+                self.last_success_model_id = provider.model_for(
+                    purpose,
+                    override_model_id=model_id,
+                )
                 logger.info(
                     "provider success name=%s purpose=%s",
                     provider.name,
@@ -383,6 +392,8 @@ class LLMManager:
         model_id: str | None,
         purpose: ModelPurpose,
     ) -> Iterator[str]:
+        self.last_success_provider_name = None
+        self.last_success_model_id = None
         last_error: BaseException | None = None
 
         for provider in self.providers:
@@ -443,6 +454,11 @@ class LLMManager:
                 continue
 
             ModelProviderHealth.record_success(provider.name)
+            self.last_success_provider_name = provider.name
+            self.last_success_model_id = provider.model_for(
+                purpose,
+                override_model_id=model_id,
+            )
             logger.info(
                 "provider stream success first_chunk name=%s purpose=%s",
                 provider.name,
