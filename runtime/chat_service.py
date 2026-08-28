@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 import time
 from datetime import datetime
+from threading import RLock
 from typing import Any, Callable, Iterator
 
 from core.agent import Agent
@@ -27,6 +28,7 @@ class ChatService:
         self.policy = policy or RuntimePolicy()
         self.event_callback = event_callback
         self.state: TaskState | None = None
+        self._state_lock = RLock()
 
     def chat(self, user_message: str) -> ChatResult:
         if self.policy.stream:
@@ -240,13 +242,18 @@ class ChatService:
             "tool_failed": EventType.TOOL_FAILED,
             "todo_created": EventType.TODO_CREATED,
             "todo_updated": EventType.TODO_UPDATED,
+            "subtask_started": EventType.SUBTASK_STARTED,
+            "subtask_finished": EventType.SUBTASK_FINISHED,
+            "subtask_failed": EventType.SUBTASK_FAILED,
+            "subtask_deferred": EventType.SUBTASK_DEFERRED,
         }
         if event_type.startswith("todo_"):
-            state.todos = [
-                dict(item)
-                for item in data.get("todos", [])
-                if isinstance(item, dict)
-            ]
+            with self._state_lock:
+                state.todos = [
+                    dict(item)
+                    for item in data.get("todos", [])
+                    if isinstance(item, dict)
+                ]
 
         mapped_type = event_mapping.get(event_type)
         if mapped_type is None:
@@ -257,8 +264,10 @@ class ChatService:
         )
 
     def _emit_event(self, state: TaskState, event: ChatEvent) -> None:
-        if self.policy.collect_events:
-            state.events.append(event)
+        with self._state_lock:
+            event.seq = len(state.events)
+            if self.policy.collect_events:
+                state.events.append(event)
         if self.event_callback is not None:
             self.event_callback(event)
 
@@ -273,7 +282,6 @@ class ChatService:
         return ChatEvent(
             task_id=state.task_id,
             event_type=event_type,
-            seq=len(state.events),
             data=data or {},
             error=error,
         )

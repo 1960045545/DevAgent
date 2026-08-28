@@ -7,8 +7,10 @@ from typing import Any, Callable, Iterator
 from openai import OpenAI
 
 from core.invoke_options import InvokeOptions
+from core.delegation import SubtaskExecutor
 from core.message import Message
 from core.response import ModelResponse
+from core.skills import Skill, SkillLoader
 from core.tool_registry import ToolRegistry
 from core.tool_hooks import ToolHook
 from core.tool_space import ToolSpec
@@ -48,8 +50,22 @@ class Agent:
         history_abstract_model_id: str | None = None,
         prompt_dir: str | Path | None = None,
         tool_hooks: list[ToolHook] | None = None,
+        startup_dir: str | Path | None = None,
+        skills_dir: str | Path | None = None,
     ) -> None:
         self.retry_backoff = retry_backoff
+        self.startup_dir = (
+            Path(startup_dir).expanduser().resolve()
+            if startup_dir is not None
+            else Path.cwd().resolve()
+        )
+        self.skills_dir = (
+            Path(skills_dir).expanduser().resolve()
+            if skills_dir is not None
+            else self.startup_dir / "skills"
+        )
+        self.skills: tuple[Skill, ...] = SkillLoader(self.skills_dir).load()
+        self.skills_prompt = SkillLoader.format_for_prompt(self.skills)
         self.llm_manager = LLMManager(
             base_url=base_url,
             api_key=api_key,
@@ -93,9 +109,10 @@ class Agent:
         self.client = self.llm_manager.client
         self.tool_registry = self.tool_manager.tool_registry
         logger.info(
-            "agent initialized model=%s providers=%s",
+            "agent initialized model=%s providers=%s skills=%s",
             self.model_id,
             [provider.name for provider in (providers or [])] or ["default"],
+            [skill.name for skill in self.skills],
         )
 
     @property
@@ -173,10 +190,9 @@ class Agent:
         self.memory_manager.compress_if_needed()
         system_prompt = self._build_chat_system_prompt()
         request_options = options or InvokeOptions()
-        todo_toolset = (
-            TodoToolset(observer=progress_callback)
-            if is_complex_task(user_message)
-            else None
+        todo_toolset = self._build_todo_toolset(
+            user_message,
+            progress_callback,
         )
         if todo_toolset is not None:
             request_options = self.tool_manager.merge_options(
@@ -231,10 +247,9 @@ class Agent:
         self.memory_manager.compress_if_needed()
         system_prompt = self._build_chat_system_prompt()
         request_options = options or InvokeOptions()
-        todo_toolset = (
-            TodoToolset(observer=progress_callback)
-            if is_complex_task(user_message)
-            else None
+        todo_toolset = self._build_todo_toolset(
+            user_message,
+            progress_callback,
         )
         if todo_toolset is not None:
             request_options = self.tool_manager.merge_options(
@@ -291,11 +306,33 @@ class Agent:
         history_text, recent_text = (
             self.memory_manager.get_prompt_texts()
         )
-        return self.prompt_manager.build_chat_system_prompt(
+        prompt = self.prompt_manager.build_chat_system_prompt(
             history=history_text,
             recent_chat_record=recent_text,
             user_profile=self.profile_manager.format(),
         )
+        return (
+            f"{prompt}\n\n"
+            "## 本地技能\n"
+            f"{self.skills_prompt}"
+        )
+
+    def _build_todo_toolset(
+        self,
+        user_message: str,
+        progress_callback: Callable[[str, dict[str, Any]], None] | None,
+    ) -> TodoToolset | None:
+        if not is_complex_task(user_message):
+            return None
+
+        todo_toolset = TodoToolset(observer=progress_callback)
+        executor = SubtaskExecutor(
+            self,
+            todo_toolset.todo_list,
+            progress_callback=progress_callback,
+        )
+        todo_toolset.delegate_handler = executor.delegate
+        return todo_toolset
 
     def _build_chat_prompt(self, user_message: str) -> str:
         system_prompt = self._build_chat_system_prompt()

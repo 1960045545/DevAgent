@@ -125,6 +125,26 @@ def print_progress_event(event: ChatEvent) -> None:
             f"{event.data.get('name', 'unknown')} failed: "
             f"{event.data.get('error', event.error or 'unknown error')}",
         )
+    elif event.event_type == EventType.SUBTASK_STARTED:
+        print(
+            f"\n[subtask] {event.data.get('task_id', '?')} started: "
+            f"{event.data.get('title', '')}",
+        )
+    elif event.event_type == EventType.SUBTASK_FINISHED:
+        print(
+            f"\n[subtask] {event.data.get('task_id', '?')} finished: "
+            f"{event.data.get('summary', '')}",
+        )
+    elif event.event_type == EventType.SUBTASK_DEFERRED:
+        print(
+            f"\n[subtask] {event.data.get('task_id', '?')} deferred: "
+            f"{event.data.get('error', event.data.get('summary', ''))}",
+        )
+    elif event.event_type == EventType.SUBTASK_FAILED:
+        print(
+            f"\n[subtask] {event.data.get('task_id', '?')} failed: "
+            f"{event.data.get('error', event.data.get('summary', ''))}",
+        )
 
 
 def _print_todo_snapshot(data: dict[str, object]) -> None:
@@ -132,7 +152,15 @@ def _print_todo_snapshot(data: dict[str, object]) -> None:
         if not isinstance(todo, dict):
             continue
         status = str(todo.get("status", "pending"))
-        marker = "[x]" if status == "completed" else "[!]" if status == "blocked" else "[>]" if status == "in_progress" else "[ ]"
+        marker = (
+            "[x]"
+            if status == "completed"
+            else "[!]"
+            if status in {"blocked", "failed"}
+            else "[>]"
+            if status == "in_progress"
+            else "[ ]"
+        )
         note = f" ({todo['note']})" if todo.get("note") else ""
         print(
             f"[todo] {marker} {todo.get('item_id', '?')}: "
@@ -165,6 +193,8 @@ if __name__ == "__main__":
         cooldown_seconds=30,
         max_tokens=3000,
         timeout=120,
+        startup_dir=os.getenv("AGENT_STARTUP_DIR") or None,
+        skills_dir=os.getenv("AGENT_SKILLS_DIR") or None,
     )
 
     chat_agent.register_tool(add_tool, add)

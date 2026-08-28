@@ -5,6 +5,7 @@ import inspect
 import json
 import logging
 from dataclasses import replace
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Callable
 
 from core.invoke_options import InvokeOptions
@@ -166,13 +167,13 @@ class ToolManager:
                 logger.info("tool chat finished without tool call")
                 return response
 
-            if (
+            first_round_plan = (
                 todo_list is not None
                 and not todo_list.created
-                and any(
-                    tool_call.name != "todo_create"
-                    for tool_call in response.tool_calls
-                )
+            )
+            if first_round_plan and not any(
+                tool_call.name == "todo_create"
+                for tool_call in response.tool_calls
             ):
                 raise AgentRequestError(
                     "complex tasks must create a todo list before using other tools",
@@ -183,7 +184,34 @@ class ToolManager:
                 self.llm_manager.assistant_message_from_response(data)
             )
 
-            for tool_call in response.tool_calls:
+            tool_calls = response.tool_calls
+            deferred_tool_calls: list[ToolCall] = []
+            if first_round_plan:
+                executable_plan_calls = [
+                    tool_call
+                    for tool_call in response.tool_calls
+                    if tool_call.name == "todo_create"
+                ][:1]
+                tool_calls = executable_plan_calls
+                executable_call_ids = {
+                    id(tool_call)
+                    for tool_call in executable_plan_calls
+                }
+                deferred_tool_calls = [
+                    tool_call
+                    for tool_call in response.tool_calls
+                    if id(tool_call) not in executable_call_ids
+                ]
+
+            delegated_calls = self._parallel_delegated_calls(
+                tool_calls,
+                todo_list,
+                handlers=options.tool_handlers,
+                spec_by_name=spec_by_name,
+                round_index=round_index,
+                progress_callback=progress_callback,
+            )
+            for tool_call in tool_calls:
                 if not tool_call.id:
                     raise AgentRequestError(
                         "tool_call id is required",
@@ -195,16 +223,38 @@ class ToolManager:
                     tool_call.name,
                     tool_call.id,
                 )
+                tool_result = delegated_calls.get(tool_call.id)
+                if tool_result is None:
+                    tool_result = self._execute_tool_call(
+                        tool_call,
+                        options.tool_handlers,
+                        spec_by_name=spec_by_name,
+                        round_index=round_index,
+                        progress_callback=progress_callback,
+                    )
                 messages.append(
                     {
                         "role": "tool",
                         "tool_call_id": tool_call.id,
-                        "content": self._execute_tool_call(
-                            tool_call,
-                            options.tool_handlers,
-                            spec_by_name=spec_by_name,
-                            round_index=round_index,
-                            progress_callback=progress_callback,
+                        "content": tool_result,
+                    }
+                )
+
+            # The API requires one tool result for every call in an assistant
+            # message. These calls are explicitly deferred, never executed.
+            for tool_call in deferred_tool_calls:
+                if not tool_call.id:
+                    raise AgentRequestError(
+                        "tool_call id is required",
+                        retryable=False,
+                    )
+                messages.append(
+                    {
+                        "role": "tool",
+                        "tool_call_id": tool_call.id,
+                        "content": (
+                            "Deferred until the next round: the execution plan "
+                            "was created first. Do not treat this as executed."
                         ),
                     }
                 )
@@ -213,6 +263,81 @@ class ToolManager:
             "max tool rounds exceeded",
             retryable=False,
         )
+
+    def _parallel_delegated_calls(
+        self,
+        tool_calls: list[ToolCall],
+        todo_list: TodoList | None,
+        *,
+        handlers: dict[str, Any],
+        spec_by_name: dict[str, ToolSpec],
+        round_index: int,
+        progress_callback: Callable[[str, dict[str, Any]], None] | None,
+    ) -> dict[str, str]:
+        if todo_list is None:
+            return {}
+
+        candidates = [
+            tool_call
+            for tool_call in tool_calls
+            if tool_call.name == "todo_delegate"
+            and tool_call.id
+            and isinstance(tool_call.arguments, dict)
+        ]
+        if len(candidates) < 2:
+            return {}
+
+        ready: list[ToolCall] = []
+        deferred: dict[str, str] = {}
+        seen_items: set[str] = set()
+        for tool_call in candidates:
+            item_id = str(tool_call.arguments.get("item_id", ""))
+            if item_id in seen_items:
+                deferred[tool_call.id or "unknown"] = (
+                    "Deferred because the same todo item was delegated more than once."
+                )
+                continue
+            seen_items.add(item_id)
+            try:
+                is_ready = todo_list.is_ready(item_id)
+            except Exception as exc:
+                deferred[tool_call.id or "unknown"] = f"Deferred: {exc}"
+                continue
+            if is_ready:
+                ready.append(tool_call)
+            else:
+                deferred[tool_call.id or "unknown"] = (
+                    "Deferred until its todo dependencies are completed."
+                )
+
+        if ready:
+            if len(ready) >= 2:
+                with ThreadPoolExecutor(max_workers=len(ready)) as executor:
+                    futures = {
+                        tool_call.id: executor.submit(
+                            self._execute_tool_call,
+                            tool_call,
+                            handlers,
+                            spec_by_name=spec_by_name,
+                            round_index=round_index,
+                            progress_callback=progress_callback,
+                        )
+                        for tool_call in ready
+                    }
+                    for call_id, future in futures.items():
+                        deferred[call_id or "unknown"] = future.result()
+            else:
+                tool_call = ready[0]
+                deferred[tool_call.id or "unknown"] = self._execute_tool_call(
+                    tool_call,
+                    handlers,
+                    spec_by_name=spec_by_name,
+                    round_index=round_index,
+                    progress_callback=progress_callback,
+                )
+            return deferred
+
+        return deferred
 
     @staticmethod
     def _tool_spec_name(tool: Any) -> str | None:
