@@ -2,17 +2,18 @@ from __future__ import annotations
 
 import os
 
-from dotenv import load_dotenv
-
+from config.settings import load_project_env
 from core import agent
 from core.tool_space import ToolSpec
+from core.workspace_tools import register_workspace_tools
 from manager.log_manager import configure_logging
 from manager.model_provider_manager import ModelProviderConfig
 from runtime.chat_service import ChatService
+from runtime.event import ChatEvent, EventType
 from runtime.policy import RuntimePolicy
 
 
-load_dotenv()
+load_project_env()
 configure_logging()
 
 
@@ -37,6 +38,7 @@ add_tool = ToolSpec(
         },
         "required": ["a", "b"],
     },
+    category="calculation",
 )
 
 
@@ -100,6 +102,44 @@ def print_stream_result(chat_service: ChatService, user_msg: str) -> None:
         )
 
 
+def print_progress_event(event: ChatEvent) -> None:
+    if event.event_type == EventType.TODO_CREATED:
+        print("\n[todo] plan created")
+        _print_todo_snapshot(event.data)
+    elif event.event_type == EventType.TODO_UPDATED:
+        print("\n[todo] progress updated")
+        _print_todo_snapshot(event.data)
+    elif event.event_type == EventType.TOOL_STARTED:
+        print(
+            f"\n[tool] {event.data.get('category', 'general')}/"
+            f"{event.data.get('name', 'unknown')} started",
+        )
+    elif event.event_type == EventType.TOOL_FINISHED:
+        print(
+            f"\n[tool] {event.data.get('category', 'general')}/"
+            f"{event.data.get('name', 'unknown')} finished",
+        )
+    elif event.event_type == EventType.TOOL_FAILED:
+        print(
+            f"\n[tool] {event.data.get('category', 'general')}/"
+            f"{event.data.get('name', 'unknown')} failed: "
+            f"{event.data.get('error', event.error or 'unknown error')}",
+        )
+
+
+def _print_todo_snapshot(data: dict[str, object]) -> None:
+    for todo in data.get("todos", []):
+        if not isinstance(todo, dict):
+            continue
+        status = str(todo.get("status", "pending"))
+        marker = "[x]" if status == "completed" else "[!]" if status == "blocked" else "[>]" if status == "in_progress" else "[ ]"
+        note = f" ({todo['note']})" if todo.get("note") else ""
+        print(
+            f"[todo] {marker} {todo.get('item_id', '?')}: "
+            f"{todo.get('title', '')}{note}",
+        )
+
+
 def print_normal_result(chat_service: ChatService, user_msg: str) -> None:
     result = chat_service.response_chat(user_msg)
     print(result.text)
@@ -128,6 +168,7 @@ if __name__ == "__main__":
     )
 
     chat_agent.register_tool(add_tool, add)
+    register_workspace_tools(chat_agent.tool_registry)
 
     chat_service = ChatService(
         chat_agent,
@@ -137,6 +178,7 @@ if __name__ == "__main__":
             stream_batch_chars=12,
             stream_batch_seconds=0.1,
         ),
+        event_callback=print_progress_event,
     )
 
     print("Runtime chat test started.")

@@ -3,7 +3,7 @@ from __future__ import annotations
 import logging
 import time
 from datetime import datetime
-from typing import Iterator
+from typing import Any, Callable, Iterator
 
 from core.agent import Agent
 
@@ -21,9 +21,11 @@ class ChatService:
         self,
         agent: Agent,
         policy: RuntimePolicy | None = None,
+        event_callback: Callable[[ChatEvent], None] | None = None,
     ) -> None:
         self.agent = agent
         self.policy = policy or RuntimePolicy()
+        self.event_callback = event_callback
         self.state: TaskState | None = None
 
     def chat(self, user_message: str) -> ChatResult:
@@ -36,7 +38,10 @@ class ChatService:
         state = self._start_state(user_message)
 
         try:
-            response = self.agent.chat(user_message)
+            response = self.agent.chat(
+                user_message,
+                progress_callback=self._on_agent_progress,
+            )
             assistant_text = response.text or ""
             state.assistant_output = assistant_text
             state.model_id = (
@@ -50,14 +55,14 @@ class ChatService:
             state.status = TaskStatus.COMPLETED
             state.end_time = datetime.now()
 
-            if self.policy.collect_events:
-                state.events.append(
-                    self._build_event(
-                        state,
-                        EventType.COMPLETED,
-                        data={"text": assistant_text},
-                    )
+            self._emit_event(
+                state,
+                self._build_event(
+                    state,
+                    EventType.COMPLETED,
+                    data={"text": assistant_text},
                 )
+            )
 
             return ChatResult(
                 task_id=state.task_id,
@@ -73,15 +78,15 @@ class ChatService:
             state.error_msg = str(exc)
             state.end_time = datetime.now()
 
-            if self.policy.collect_events:
-                state.events.append(
-                    self._build_event(
-                        state,
-                        EventType.FAILED,
-                        data={"text": state.assistant_output},
-                        error=str(exc),
-                    )
+            self._emit_event(
+                state,
+                self._build_event(
+                    state,
+                    EventType.FAILED,
+                    data={"text": state.assistant_output},
+                    error=str(exc),
                 )
+            )
 
             logger.exception("response chat failed")
 
@@ -106,7 +111,10 @@ class ChatService:
         last_flush = time.monotonic()
 
         try:
-            for chunk in self.agent.stream_chat(user_message):
+            for chunk in self.agent.stream_chat(
+                user_message,
+                progress_callback=self._on_agent_progress,
+            ):
                 if not chunk:
                     continue
 
@@ -121,14 +129,14 @@ class ChatService:
                     )
 
                 state.assistant_output += chunk
-                if self.policy.collect_events:
-                    state.events.append(
-                        self._build_event(
-                            state,
-                            EventType.DELTA,
-                            data={"text": chunk},
-                        )
+                self._emit_event(
+                    state,
+                    self._build_event(
+                        state,
+                        EventType.DELTA,
+                        data={"text": chunk},
                     )
+                )
 
                 buffer.append(chunk)
                 buffer_length += len(chunk)
@@ -150,14 +158,14 @@ class ChatService:
             state.status = TaskStatus.COMPLETED
             state.end_time = datetime.now()
 
-            if self.policy.collect_events:
-                state.events.append(
-                    self._build_event(
-                        state,
-                        EventType.COMPLETED,
-                        data={"text": state.assistant_output},
-                    )
+            self._emit_event(
+                state,
+                self._build_event(
+                    state,
+                    EventType.COMPLETED,
+                    data={"text": state.assistant_output},
                 )
+            )
         except Exception as exc:
             if buffer:
                 yield "".join(buffer)
@@ -166,15 +174,15 @@ class ChatService:
             state.error_msg = str(exc)
             state.end_time = datetime.now()
 
-            if self.policy.collect_events:
-                state.events.append(
-                    self._build_event(
-                        state,
-                        EventType.FAILED,
-                        data={"text": state.assistant_output},
-                        error=str(exc),
-                    )
+            self._emit_event(
+                state,
+                self._build_event(
+                    state,
+                    EventType.FAILED,
+                    data={"text": state.assistant_output},
+                    error=str(exc),
                 )
+            )
 
             logger.exception("stream chat failed")
 
@@ -211,7 +219,48 @@ class ChatService:
         state.status = TaskStatus.RUNNING
         state.start_time = datetime.now()
         self.state = state
+        self._emit_event(
+            state,
+            self._build_event(state, EventType.STARTED),
+        )
         return state
+
+    def _on_agent_progress(
+        self,
+        event_type: str,
+        data: dict[str, Any],
+    ) -> None:
+        state = self.state
+        if state is None:
+            return
+
+        event_mapping = {
+            "tool_started": EventType.TOOL_STARTED,
+            "tool_finished": EventType.TOOL_FINISHED,
+            "tool_failed": EventType.TOOL_FAILED,
+            "todo_created": EventType.TODO_CREATED,
+            "todo_updated": EventType.TODO_UPDATED,
+        }
+        if event_type.startswith("todo_"):
+            state.todos = [
+                dict(item)
+                for item in data.get("todos", [])
+                if isinstance(item, dict)
+            ]
+
+        mapped_type = event_mapping.get(event_type)
+        if mapped_type is None:
+            return
+        self._emit_event(
+            state,
+            self._build_event(state, mapped_type, data=data),
+        )
+
+    def _emit_event(self, state: TaskState, event: ChatEvent) -> None:
+        if self.policy.collect_events:
+            state.events.append(event)
+        if self.event_callback is not None:
+            self.event_callback(event)
 
     def _build_event(
         self,

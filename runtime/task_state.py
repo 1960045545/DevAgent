@@ -23,5 +23,6 @@ class TaskState:
     end_time: datetime | None = None
     error_msg: str | None = None
     events: list[ChatEvent] = field(default_factory=list)
+    todos: list[dict[str, object]] = field(default_factory=list)
     model_id: str | None = None
     provider_name: str | None = None

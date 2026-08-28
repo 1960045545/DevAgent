@@ -10,7 +10,9 @@ from core.invoke_options import InvokeOptions
 from core.message import Message
 from core.response import ModelResponse
 from core.tool_registry import ToolRegistry
+from core.tool_hooks import ToolHook
 from core.tool_space import ToolSpec
+from core.todo import TodoToolset, is_complex_task
 from manager.llm_manager import LLMManager
 from manager.memory_manager import MemoryManager
 from manager.model_provider_manager import ModelProviderConfig
@@ -45,6 +47,7 @@ class Agent:
         user_profile_model_id: str | None = None,
         history_abstract_model_id: str | None = None,
         prompt_dir: str | Path | None = None,
+        tool_hooks: list[ToolHook] | None = None,
     ) -> None:
         self.retry_backoff = retry_backoff
         self.llm_manager = LLMManager(
@@ -78,6 +81,7 @@ class Agent:
         self.tool_manager = ToolManager(
             llm_manager=self.llm_manager,
             tool_registry=tool_registry,
+            hooks=tool_hooks,
         )
 
         self.base_url = self.llm_manager.base_url
@@ -140,6 +144,12 @@ class Agent:
             handler,
         )
 
+    def register_tool_hook(self, hook: ToolHook) -> None:
+        self.tool_manager.register_hook(hook)
+
+    def unregister_tool_hook(self, hook: ToolHook) -> None:
+        self.tool_manager.unregister_hook(hook)
+
     async def ainvoke(
         self,
         message: Message,
@@ -156,20 +166,39 @@ class Agent:
         self,
         user_message: str,
         options: InvokeOptions | None = None,
+        *,
+        progress_callback: Callable[[str, dict[str, Any]], None] | None = None,
     ) -> ModelResponse:
         logger.info("chat start")
         self.memory_manager.compress_if_needed()
         system_prompt = self._build_chat_system_prompt()
-        options = self.tool_manager.merge_options(
-            options or InvokeOptions()
+        request_options = options or InvokeOptions()
+        todo_toolset = (
+            TodoToolset(observer=progress_callback)
+            if is_complex_task(user_message)
+            else None
         )
+        if todo_toolset is not None:
+            request_options = self.tool_manager.merge_options(
+                request_options,
+                extra_specs=todo_toolset.specs,
+                extra_handlers=todo_toolset.handlers,
+            )
+        else:
+            request_options = self.tool_manager.merge_options(request_options)
 
-        if options.tools:
+        if request_options.tools:
             logger.info("chat route=tool")
             response = self.tool_manager.chat_with_tools(
                 prompt=system_prompt,
                 user_message=user_message,
-                options=options,
+                options=request_options,
+                todo_list=(
+                    todo_toolset.todo_list
+                    if todo_toolset is not None
+                    else None
+                ),
+                progress_callback=progress_callback,
             )
         else:
             logger.info("chat route=normal")
@@ -181,7 +210,7 @@ class Agent:
                     ).to_dict(),
                     Message(role="user", content=user_message).to_dict(),
                 ],
-                options=options,
+                options=request_options,
                 purpose="chat",
             )
 
@@ -195,20 +224,39 @@ class Agent:
         self,
         user_message: str,
         options: InvokeOptions | None = None,
+        *,
+        progress_callback: Callable[[str, dict[str, Any]], None] | None = None,
     ) -> Iterator[str]:
         logger.info("stream_chat start")
         self.memory_manager.compress_if_needed()
         system_prompt = self._build_chat_system_prompt()
-        options = self.tool_manager.merge_options(
-            options or InvokeOptions()
+        request_options = options or InvokeOptions()
+        todo_toolset = (
+            TodoToolset(observer=progress_callback)
+            if is_complex_task(user_message)
+            else None
         )
+        if todo_toolset is not None:
+            request_options = self.tool_manager.merge_options(
+                request_options,
+                extra_specs=todo_toolset.specs,
+                extra_handlers=todo_toolset.handlers,
+            )
+        else:
+            request_options = self.tool_manager.merge_options(request_options)
 
-        if options.tools:
+        if request_options.tools:
             logger.info("stream_chat route=tool")
             response = self.tool_manager.chat_with_tools(
                 prompt=system_prompt,
                 user_message=user_message,
-                options=options,
+                options=request_options,
+                todo_list=(
+                    todo_toolset.todo_list
+                    if todo_toolset is not None
+                    else None
+                ),
+                progress_callback=progress_callback,
             )
             self._finish_chat_turn(
                 user_message=user_message,
@@ -228,7 +276,7 @@ class Agent:
                 ).to_dict(),
                 Message(role="user", content=user_message).to_dict(),
             ],
-            options=options,
+            options=request_options,
             purpose="chat",
         ):
             chunks.append(chunk)

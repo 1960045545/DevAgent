@@ -38,6 +38,10 @@ class ToolRegistry:
     def has(self, name: str) -> bool:
         return name in self._tools
 
+    def get_spec(self, name: str) -> ToolSpec | None:
+        tool = self._tools.get(name)
+        return None if tool is None else tool.spec
+
     def get_handler(
         self,
         name: str,
@@ -49,11 +53,18 @@ class ToolRegistry:
 
         return tool.handler
 
-    def list_specs(self) -> list[ToolSpec]:
-        return [
+    def list_specs(self, category: str | None = None) -> list[ToolSpec]:
+        specs = [
             tool.spec
             for tool in self._tools.values()
         ]
+        if category is None:
+            return specs
+        normalized = category.strip().lower()
+        return [spec for spec in specs if spec.category == normalized]
+
+    def list_categories(self) -> list[str]:
+        return sorted({spec.category for spec in self.list_specs()})
 
     def handlers(self) -> dict[str, Callable[..., Any]]:
         return {

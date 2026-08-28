@@ -11,6 +11,9 @@ class EventType(str, Enum):
     FAILED = "failed"
     TOOL_STARTED = "tool_started"
     TOOL_FINISHED = "tool_finished"
+    TOOL_FAILED = "tool_failed"
+    TODO_CREATED = "todo_created"
+    TODO_UPDATED = "todo_updated"
 
 @dataclass
 class ChatEvent:
