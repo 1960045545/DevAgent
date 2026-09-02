@@ -42,7 +42,7 @@ class ChatService:
         try:
             response = self.agent.chat(
                 user_message,
-                progress_callback=self._on_agent_progress,
+                progress_callback=self._progress_callback(state),
             )
             assistant_text = response.text or ""
             state.assistant_output = assistant_text
@@ -115,7 +115,7 @@ class ChatService:
         try:
             for chunk in self.agent.stream_chat(
                 user_message,
-                progress_callback=self._on_agent_progress,
+                progress_callback=self._progress_callback(state),
             ):
                 if not chunk:
                     continue
@@ -231,8 +231,10 @@ class ChatService:
         self,
         event_type: str,
         data: dict[str, Any],
+        *,
+        target_state: TaskState | None = None,
     ) -> None:
-        state = self.state
+        state = target_state or self.state
         if state is None:
             return
 
@@ -246,6 +248,10 @@ class ChatService:
             "subtask_finished": EventType.SUBTASK_FINISHED,
             "subtask_failed": EventType.SUBTASK_FAILED,
             "subtask_deferred": EventType.SUBTASK_DEFERRED,
+            "background_queued": EventType.BACKGROUND_QUEUED,
+            "background_started": EventType.BACKGROUND_STARTED,
+            "background_completed": EventType.BACKGROUND_COMPLETED,
+            "background_failed": EventType.BACKGROUND_FAILED,
         }
         if event_type.startswith("todo_"):
             with self._state_lock:
@@ -254,6 +260,11 @@ class ChatService:
                     for item in data.get("tasks", data.get("todos", []))
                     if isinstance(item, dict)
                 ]
+        if event_type.startswith("background_"):
+            job_id = str(data.get("job_id", "")).strip()
+            if job_id:
+                with self._state_lock:
+                    state.background_jobs[job_id] = dict(data)
 
         mapped_type = event_mapping.get(event_type)
         if mapped_type is None:
@@ -262,6 +273,19 @@ class ChatService:
             state,
             self._build_event(state, mapped_type, data=data),
         )
+
+    def _progress_callback(
+        self,
+        state: TaskState,
+    ) -> Callable[[str, dict[str, Any]], None]:
+        def callback(event_type: str, data: dict[str, Any]) -> None:
+            self._on_agent_progress(
+                event_type,
+                data,
+                target_state=state,
+            )
+
+        return callback
 
     def _emit_event(self, state: TaskState, event: ChatEvent) -> None:
         with self._state_lock:

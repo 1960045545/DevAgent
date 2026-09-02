@@ -145,6 +145,24 @@ def print_progress_event(event: ChatEvent) -> None:
             f"\n[subtask] {event.data.get('task_id', '?')} failed: "
             f"{event.data.get('error', event.data.get('summary', ''))}",
         )
+    elif event.event_type == EventType.BACKGROUND_QUEUED:
+        print(
+            f"\n[background] {event.data.get('job_id', '?')} queued: "
+            f"{event.data.get('name', '')}",
+        )
+    elif event.event_type == EventType.BACKGROUND_STARTED:
+        print(
+            f"\n[background] {event.data.get('job_id', '?')} started",
+        )
+    elif event.event_type == EventType.BACKGROUND_COMPLETED:
+        print(
+            f"\n[background] {event.data.get('job_id', '?')} completed",
+        )
+    elif event.event_type == EventType.BACKGROUND_FAILED:
+        print(
+            f"\n[background] {event.data.get('job_id', '?')} failed: "
+            f"{event.data.get('error', 'unknown error')}",
+        )
 
 
 def _print_todo_snapshot(data: dict[str, object]) -> None:
@@ -158,7 +176,7 @@ def _print_todo_snapshot(data: dict[str, object]) -> None:
             else "[!]"
             if status in {"blocked", "failed"}
             else "[>]"
-            if status == "in_progress"
+            if status in {"in_progress", "in_process"}
             else "[ ]"
         )
         note = f" ({todo['note']})" if todo.get("note") else ""

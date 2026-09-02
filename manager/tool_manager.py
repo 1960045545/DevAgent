@@ -158,6 +158,21 @@ class ToolManager:
 
             if not response.tool_calls:
                 if todo_list is not None and not todo_list.is_terminal:
+                    if (
+                        todo_list.can_pause_for_background
+                    ):
+                        logger.info(
+                            "tool chat paused while background tasks continue"
+                        )
+                        if not response.text.strip():
+                            active_tasks = todo_list.snapshot()[
+                                "active_background_task_ids"
+                            ]
+                            response.text = (
+                                "Background tasks are still running: "
+                                + ", ".join(active_tasks)
+                            )
+                        return response
                     messages.append(
                         self.llm_manager.assistant_message_from_response(data)
                     )
@@ -510,6 +525,10 @@ class ToolManager:
             "First call todo_claim to move pending to in_process. After the "
             "work is actually finished call todo_complete with an execution "
             "summary. Call todo_block with a reason when a task cannot proceed. "
+            "For npm install, pip install, or another long command, call "
+            "todo_run_background and continue other ready tasks. If only "
+            "background tasks remain, report their job ids and return; the "
+            "host will notify the user when they finish. "
             "Current state: "
             f"{todo_list.snapshot()}"
         )

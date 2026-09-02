@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import logging
 import os
 from dataclasses import replace
@@ -23,6 +24,10 @@ from manager.model_provider_manager import ModelProviderConfig
 from manager.prompt_manager import PromptManager
 from manager.tool_manager import ToolManager
 from manager.user_profile_manager import UserProfileManager
+from runtime.background_worker import (
+    BackgroundTaskManager,
+    TodoBackgroundExecutor,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -55,6 +60,7 @@ class Agent:
         startup_dir: str | Path | None = None,
         skills_dir: str | Path | None = None,
         workspace_root: str | Path | None = None,
+        enable_background: bool = True,
     ) -> None:
         self.retry_backoff = retry_backoff
         self.startup_dir = (
@@ -126,6 +132,11 @@ class Agent:
         self.default_headers = self.llm_manager.default_headers
         self.client = self.llm_manager.client
         self.tool_registry = self.tool_manager.tool_registry
+        self.background_manager = (
+            BackgroundTaskManager() if enable_background else None
+        )
+        if self.background_manager is not None:
+            self.background_manager.register(self.tool_registry)
         logger.info(
             "agent initialized model=%s providers=%s skills=%s",
             self.model_id,
@@ -378,7 +389,7 @@ class Agent:
             enabled_tools=enabled_tools,
             workspace=self.workspace_root,
             skills_catalog=self.skills_prompt if self.skills else "",
-            operation_history=self.memory_manager.get_operation_prompt_text(),
+            operation_history=self._operation_history_prompt(),
             todo_enabled=todo_toolset is not None,
             delegation_enabled=(
                 todo_toolset is not None
@@ -389,6 +400,25 @@ class Agent:
                 if todo_toolset is not None
                 else None
             ),
+        )
+
+    def _operation_history_prompt(self) -> str:
+        operation_history = self.memory_manager.get_operation_prompt_text()
+        if self.background_manager is None:
+            return operation_history
+        notifications = self.background_manager.notifications(consume=False)
+        if not notifications["count"]:
+            return operation_history
+        background_text = (
+            "未读后台任务通知：\n"
+            + json.dumps(
+                notifications["notifications"],
+                ensure_ascii=False,
+                default=str,
+            )
+        )
+        return "\n\n".join(
+            part for part in (operation_history, background_text) if part
         )
 
     def _merge_runtime_tools(
@@ -453,6 +483,26 @@ class Agent:
             progress_callback=progress_callback,
         )
         todo_toolset.delegate_handler = executor.delegate
+        shell_runner = self.tool_registry.get_handler("workspace_run_shell")
+        shell_owner = getattr(shell_runner, "__self__", None)
+        shell_preflight = getattr(
+            shell_owner,
+            "preflight_background_shell",
+            None,
+        )
+        if (
+            self.background_manager is not None
+            and callable(shell_runner)
+            and callable(shell_preflight)
+        ):
+            background_executor = TodoBackgroundExecutor(
+                self.background_manager,
+                todo_toolset.todo_list,
+                shell_runner,
+                shell_preflight=shell_preflight,
+                progress_callback=progress_callback,
+            )
+            todo_toolset.background_handler = background_executor.run
         return todo_toolset
 
     def _build_chat_prompt(self, user_message: str) -> str:

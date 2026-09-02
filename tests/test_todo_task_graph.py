@@ -2,7 +2,7 @@ import threading
 import unittest
 from concurrent.futures import ThreadPoolExecutor
 
-from core.todo import Task, TodoList, TodoToolset
+from core.todo import Task, TodoList, TodoToolset, is_complex_task
 
 
 class TaskGraphTests(unittest.TestCase):
@@ -107,6 +107,15 @@ class TaskGraphTests(unittest.TestCase):
     def test_toolset_registers_explicit_actions(self) -> None:
         names = {spec.name for spec in TodoToolset().specs}
         self.assertTrue({"todo_claim", "todo_complete", "todo_block"}.issubset(names))
+        background_names = {
+            spec.name
+            for spec in TodoToolset(background_handler=lambda **_: None).specs
+        }
+        self.assertIn("todo_run_background", background_names)
+
+    def test_long_install_requests_are_complex_tasks(self) -> None:
+        self.assertTrue(is_complex_task("请运行 npm install"))
+        self.assertTrue(is_complex_task("安装依赖"))
 
 
 if __name__ == "__main__":

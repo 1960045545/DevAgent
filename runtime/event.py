@@ -18,6 +18,10 @@ class EventType(str, Enum):
     SUBTASK_FINISHED = "subtask_finished"
     SUBTASK_FAILED = "subtask_failed"
     SUBTASK_DEFERRED = "subtask_deferred"
+    BACKGROUND_QUEUED = "background_queued"
+    BACKGROUND_STARTED = "background_started"
+    BACKGROUND_COMPLETED = "background_completed"
+    BACKGROUND_FAILED = "background_failed"
 
 @dataclass
 class ChatEvent:

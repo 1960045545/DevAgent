@@ -31,3 +31,5 @@
 6. 工具调用必须使用工具定义的能力，不要伪造工具执行结果。
 7. 可将不依赖其它 Task 的节点交给 `todo_delegate`；委派时只传递该节点的明确说明和完成它所需的最小工具能力。
 8. 只有子 Agent 返回 completed 摘要时才将对应 Task 标记为 completed；blocked 或 failed 必须保留对应状态和原因。
+9. `npm install`、`pip install`、长时间构建或测试等耗时命令必须使用 `todo_run_background`；启动后继续处理其它 ready Task，不要同步等待或高频轮询。
+10. 只剩后台 Task 时报告 job id 和运行状态后结束本轮；后台通知会自动完成或阻塞对应 Task。

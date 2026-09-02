@@ -24,5 +24,6 @@ class TaskState:
     error_msg: str | None = None
     events: list[ChatEvent] = field(default_factory=list)
     todos: list[dict[str, object]] = field(default_factory=list)
+    background_jobs: dict[str, dict[str, object]] = field(default_factory=dict)
     model_id: str | None = None
     provider_name: str | None = None

@@ -24,6 +24,10 @@ _CHILD_EXCLUDED_TOOLS = {
     "todo_update",
     "todo_list",
     "todo_delegate",
+    "todo_run_background",
+    "background_list",
+    "background_get",
+    "background_notifications",
 }
 
 
@@ -311,6 +315,7 @@ class SubtaskExecutor:
             "providers": self.host_agent.llm_manager.providers,
             "tool_registry": registry,
             "enable_user_profile": False,
+            "enable_background": False,
             "prompt_dir": self.host_agent.prompt_manager.prompt_dir,
             "tool_hooks": list(self.host_agent.tool_manager.hooks),
         }

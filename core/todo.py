@@ -16,6 +16,7 @@ TaskStatus = Literal[
     "blocked",
     "failed",
 ]
+TaskExecutionMode = Literal["foreground", "background"]
 TodoStatus = Literal[
     "pending",
     "in_process",
@@ -155,6 +156,51 @@ TODO_BLOCK_SPEC = ToolSpec(
 )
 
 
+TODO_BACKGROUND_RUN_SPEC = ToolSpec(
+    name="todo_run_background",
+    description=(
+        "Run a long shell operation for one ready Task in the background. "
+        "Use this for npm install, pip install, long builds, and similar "
+        "operations. The Task stays in_process and is completed or blocked "
+        "automatically when the background job sends its notification."
+    ),
+    parameters={
+        "type": "object",
+        "properties": {
+            "task_id": {
+                "type": "string",
+                "description": "A ready pending or claimed in_process Task.",
+            },
+            "command": {
+                "type": "string",
+                "minLength": 1,
+                "description": "One workspace-safe shell command.",
+            },
+            "working_directory": {
+                "type": "string",
+                "default": ".",
+                "description": "Workspace-relative working directory.",
+            },
+            "timeout_seconds": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 3600,
+                "default": 1800,
+            },
+            "max_output_chars": {
+                "type": "integer",
+                "minimum": 100,
+                "maximum": 100000,
+                "default": 30000,
+            },
+        },
+        "required": ["task_id", "command"],
+        "additionalProperties": False,
+    },
+    category="background",
+)
+
+
 TODO_UPDATE_SPEC = ToolSpec(
     name="todo_update",
     description=(
@@ -216,6 +262,8 @@ class Task:
     status: TaskStatus = "pending"
     dependencies: list[str] = field(default_factory=list)
     blocked_reason: str = ""
+    execution_mode: TaskExecutionMode = "foreground"
+    background_job_id: str | None = None
 
     # Compatibility aliases used by the previous TodoItem API.
     @property
@@ -242,6 +290,8 @@ class Task:
             "status": self.status,
             "dependencies": list(self.dependencies),
             "blocked_reason": self.blocked_reason,
+            "execution_mode": self.execution_mode,
+            "background_job_id": self.background_job_id,
         }
 
     def to_legacy_dict(self) -> dict[str, Any]:
@@ -326,6 +376,14 @@ class TodoItem:
         return self._task.blocked_reason
 
     @property
+    def execution_mode(self) -> TaskExecutionMode:
+        return self._task.execution_mode
+
+    @property
+    def background_job_id(self) -> str | None:
+        return self._task.background_job_id
+
+    @property
     def dependencies(self) -> list[str]:
         return list(self._task.dependencies)
 
@@ -371,6 +429,28 @@ class TodoList:
             return bool(self._tasks) and all(
                 task.status in {"completed", "blocked", "failed"}
                 for task in self._tasks
+            )
+
+    @property
+    def has_active_background_tasks(self) -> bool:
+        with self._lock:
+            return any(
+                task.status == "in_process"
+                and task.background_job_id is not None
+                for task in self._tasks
+            )
+
+    @property
+    def can_pause_for_background(self) -> bool:
+        with self._lock:
+            return (
+                self.has_active_background_tasks
+                and not any(self._is_ready_locked(task) for task in self._tasks)
+                and not any(
+                    task.status == "in_process"
+                    and task.background_job_id is None
+                    for task in self._tasks
+                )
             )
 
     def create(self, items: list[TodoCreateItem]) -> dict[str, Any]:
@@ -480,6 +560,15 @@ class TodoList:
         next_status = _canonical_status(status)
         with self._lock:
             task = self._get_locked(item_id)
+            if (
+                task.background_job_id is not None
+                and task.status == "in_process"
+                and next_status != "in_process"
+            ):
+                raise ValueError(
+                    f"task {item_id} is managed by background job "
+                    f"{task.background_job_id}"
+                )
             self._validate_compat_transition(
                 task,
                 next_status,
@@ -542,10 +631,17 @@ class TodoList:
         self._emit("todo_updated", event_data)
         return snapshot
 
-    def complete(self, task_id: str, summary: str = "") -> dict[str, Any]:
+    def complete(
+        self,
+        task_id: str,
+        summary: str = "",
+        *,
+        background_job_id: str | None = None,
+    ) -> dict[str, Any]:
         """Atomically perform ``in_process -> complete -> completed``."""
         with self._lock:
             task = self._get_locked(task_id)
+            self._validate_background_owner(task, background_job_id)
             if task.status != "in_process":
                 raise ValueError(
                     f"task {task_id} can only be completed from in_process, "
@@ -563,10 +659,17 @@ class TodoList:
         self._emit("todo_updated", event_data)
         return snapshot
 
-    def block(self, task_id: str, reason: str = "") -> dict[str, Any]:
+    def block(
+        self,
+        task_id: str,
+        reason: str = "",
+        *,
+        background_job_id: str | None = None,
+    ) -> dict[str, Any]:
         """Mark a pending/in-process task blocked and propagate to dependents."""
         with self._lock:
             task = self._get_locked(task_id)
+            self._validate_background_owner(task, background_job_id)
             if task.status not in {"pending", "in_process"}:
                 raise ValueError(
                     f"task {task_id} can only be blocked from pending or "
@@ -581,6 +684,59 @@ class TodoList:
                 task_id,
                 propagated,
                 action="block",
+            )
+        self._emit("todo_updated", event_data)
+        return snapshot
+
+    def start_background(
+        self,
+        task_id: str,
+        submitter: Callable[[], str],
+        *,
+        summary: str = "",
+    ) -> dict[str, Any]:
+        """Claim or bind a Task, then atomically attach a background job."""
+        with self._lock:
+            task = self._get_locked(task_id)
+            if task.background_job_id is not None:
+                raise ValueError(
+                    f"task {task_id} already has background job "
+                    f"{task.background_job_id}"
+                )
+            previous_status = task.status
+            previous_summary = task.summary
+            previous_mode = task.execution_mode
+            if task.status == "pending":
+                if not self._is_ready_locked(task):
+                    reason = self._dependency_block_reason_locked(task)
+                    raise ValueError(
+                        f"task {task_id} is not ready for background execution"
+                        + (f": {reason}" if reason else "")
+                    )
+                task.status = "in_process"
+            elif task.status != "in_process":
+                raise ValueError(
+                    f"task {task_id} cannot start background work from "
+                    f"{task.status}"
+                )
+            task.execution_mode = "background"
+            if summary.strip():
+                task.summary = summary.strip()
+            try:
+                job_id = str(submitter()).strip()
+                if not job_id:
+                    raise ValueError("background submitter returned an empty job id")
+            except Exception:
+                task.status = previous_status
+                task.summary = previous_summary
+                task.execution_mode = previous_mode
+                raise
+            task.background_job_id = job_id
+            snapshot = self.snapshot()
+            event_data = self._task_event_data(
+                snapshot,
+                task_id,
+                action="background_start",
             )
         self._emit("todo_updated", event_data)
         return snapshot
@@ -616,6 +772,19 @@ class TodoList:
             if task.task_id == task_id:
                 return task
         raise ValueError(f"unknown todo task: {task_id}")
+
+    @staticmethod
+    def _validate_background_owner(
+        task: Task,
+        background_job_id: str | None,
+    ) -> None:
+        if task.background_job_id is None:
+            return
+        if background_job_id != task.background_job_id:
+            raise ValueError(
+                f"task {task.task_id} is managed by background job "
+                f"{task.background_job_id}"
+            )
 
     def _is_ready_locked(self, task: Task) -> bool:
         if task.status != "pending":
@@ -822,6 +991,12 @@ class TodoList:
                     for task in self._tasks
                     if task.status == "in_process"
                 ],
+                "active_background_task_ids": [
+                    task.task_id
+                    for task in self._tasks
+                    if task.status == "in_process"
+                    and task.background_job_id is not None
+                ],
                 "completed_count": sum(
                     task.status == "completed" for task in self._tasks
                 ),
@@ -845,9 +1020,11 @@ class TodoToolset:
         self,
         observer: TodoObserver | None = None,
         delegate_handler: Callable[..., Any] | None = None,
+        background_handler: Callable[..., Any] | None = None,
     ) -> None:
         self.todo_list = TodoList(observer=observer)
         self.delegate_handler = delegate_handler
+        self.background_handler = background_handler
 
     @property
     def specs(self) -> list[ToolSpec]:
@@ -861,6 +1038,8 @@ class TodoToolset:
         ]
         if self.delegate_handler is not None:
             specs.append(TODO_DELEGATE_SPEC)
+        if self.background_handler is not None:
+            specs.append(TODO_BACKGROUND_RUN_SPEC)
         return specs
 
     @property
@@ -875,6 +1054,8 @@ class TodoToolset:
         }
         if self.delegate_handler is not None:
             handlers["todo_delegate"] = self.delegate_handler
+        if self.background_handler is not None:
+            handlers["todo_run_background"] = self.background_handler
         return handlers
 
 
@@ -915,6 +1096,19 @@ def is_complex_task(message: str) -> bool:
         return True
     if text.count("?") + text.count("？") >= 2:
         return True
+    lowered = text.lower()
+    if any(
+        marker in lowered
+        for marker in (
+            "npm install",
+            "npm ci",
+            "pip install",
+            "uv sync",
+            "mvn install",
+            "安装依赖",
+        )
+    ):
+        return True
 
     markers = (
         "并且",
@@ -934,5 +1128,5 @@ def is_complex_task(message: str) -> bool:
         "also",
         "step",
     )
-    marker_count = sum(marker in text.lower() for marker in markers)
+    marker_count = sum(marker in lowered for marker in markers)
     return marker_count >= 2 or text.count("。") + text.count(".") >= 3

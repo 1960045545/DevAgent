@@ -181,7 +181,7 @@ WORKSPACE_RUN_SHELL_SPEC = ToolSpec(
             "timeout_seconds": {
                 "type": "integer",
                 "minimum": 1,
-                "maximum": 600,
+                "maximum": 3600,
                 "default": 120,
             },
             "max_output_chars": {
@@ -299,7 +299,7 @@ class WorkspaceToolSettings:
             shell_timeout_seconds=_bounded_int(
                 "AGENT_SHELL_TIMEOUT_SECONDS",
                 defaults.shell_timeout_seconds,
-                maximum=600,
+                maximum=3600,
             ),
             python_timeout_seconds=_bounded_int(
                 "AGENT_PYTHON_TIMEOUT_SECONDS",
@@ -556,12 +556,19 @@ class WorkspaceToolset:
         working_directory: str = ".",
         timeout_seconds: int | None = None,
         max_output_chars: int | None = None,
+        *,
+        _background: bool = False,
     ) -> dict[str, Any]:
         if not self.settings.allow_shell:
             raise PermissionError("shell tools are disabled")
         command = command.strip()
         if not command:
             raise ValueError("command must not be empty")
+        if self._is_long_running_command(command) and not _background:
+            raise ValueError(
+                "long-running dependency installation must use "
+                "todo_run_background"
+            )
         cwd, uses_parent_navigation = self._resolve_workspace_path(
             working_directory,
             must_exist=True,
@@ -586,7 +593,7 @@ class WorkspaceToolset:
 
         timeout = timeout_seconds or self.settings.shell_timeout_seconds
         output_limit = max_output_chars or self.settings.max_output_chars
-        timeout = min(max(timeout, 1), 600)
+        timeout = min(max(timeout, 1), 3600)
         output_limit = min(max(output_limit, 100), 100000)
         executable, args = self._shell_command(command)
 
@@ -621,6 +628,41 @@ class WorkspaceToolset:
                 "output": self._truncate(output, output_limit),
                 "shell": executable,
             }
+
+    def preflight_background_shell(
+        self,
+        command: str,
+        working_directory: str = ".",
+    ) -> dict[str, Any]:
+        """Validate a background shell request before a worker is started."""
+        if not self.settings.allow_shell:
+            raise PermissionError("shell tools are disabled")
+        command = command.strip()
+        if not command:
+            raise ValueError("command must not be empty")
+        cwd, uses_parent_navigation = self._resolve_workspace_path(
+            working_directory,
+            must_exist=True,
+        )
+        if not cwd.is_dir():
+            raise ValueError(f"not a directory: {working_directory}")
+
+        approval_reasons = self._validate_shell_command(command, cwd)
+        if uses_parent_navigation:
+            approval_reasons.append(
+                "working_directory explicitly navigates to a parent path"
+            )
+        if approval_reasons:
+            raise PermissionError(
+                "commands requiring user approval cannot run in the "
+                "background; use workspace_run_shell in the foreground: "
+                + "; ".join(approval_reasons)
+            )
+        return {
+            "command": command,
+            "working_directory": self._relative_path(cwd),
+            "approved_for_background": True,
+        }
 
     def run_python(
         self,
@@ -874,6 +916,21 @@ class WorkspaceToolset:
             re.match(r"^[A-Za-z]:[\\/]", first)
             or re.match(r"^[A-Za-z]:$", first)
             or first.startswith(("\\\\", "/"))
+        )
+
+    @staticmethod
+    def _is_long_running_command(command: str) -> bool:
+        return bool(
+            re.match(
+                r"(?i)^\s*(?:"
+                r"npm(?:\.cmd)?\s+(?:install|i|ci)"
+                r"|pip(?:3|\.exe)?\s+install"
+                r"|(?:py|python)(?:\.exe)?\s+-m\s+pip\s+install"
+                r"|uv(?:\.exe)?\s+sync"
+                r"|mvn(?:\.cmd)?\s+install"
+                r")\b",
+                command,
+            )
         )
 
     def _validate_command_paths(
