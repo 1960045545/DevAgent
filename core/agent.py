@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import logging
+import os
+from dataclasses import replace
 from pathlib import Path
 from typing import Any, Callable, Iterator
 
@@ -10,7 +12,7 @@ from core.invoke_options import InvokeOptions
 from core.delegation import SubtaskExecutor
 from core.message import Message
 from core.response import ModelResponse
-from core.skills import Skill, SkillLoader
+from core.skills import Skill, SkillLoader, SkillToolset
 from core.tool_registry import ToolRegistry
 from core.tool_hooks import ToolHook
 from core.tool_space import ToolSpec
@@ -52,6 +54,7 @@ class Agent:
         tool_hooks: list[ToolHook] | None = None,
         startup_dir: str | Path | None = None,
         skills_dir: str | Path | None = None,
+        workspace_root: str | Path | None = None,
     ) -> None:
         self.retry_backoff = retry_backoff
         self.startup_dir = (
@@ -64,7 +67,16 @@ class Agent:
             if skills_dir is not None
             else self.startup_dir / "skills"
         )
-        self.skills: tuple[Skill, ...] = SkillLoader(self.skills_dir).load()
+        self.workspace_root = (
+            Path(workspace_root).expanduser().resolve()
+            if workspace_root is not None
+            else Path(
+                os.getenv("AGENT_WORKSPACE_ROOT", str(self.startup_dir))
+            ).expanduser().resolve()
+        )
+        self.skill_loader = SkillLoader(self.skills_dir)
+        self.skills: tuple[Skill, ...] = self.skill_loader.load()
+        self.skill_toolset = SkillToolset(self.skill_loader)
         self.skills_prompt = SkillLoader.format_for_prompt(self.skills)
         self.llm_manager = LLMManager(
             base_url=base_url,
@@ -85,6 +97,12 @@ class Agent:
             prompt_manager=self.prompt_manager,
             llm_manager=self.llm_manager,
             history_abstract_model_id=history_abstract_model_id,
+            transcripts_dir=self.startup_dir / ".transcripts",
+            static_context=self.skills_prompt,
+        )
+        self.llm_manager.set_context_recovery_callbacks(
+            context_compactor=self.memory_manager.compress_if_needed,
+            context_transcript_writer=self.memory_manager.write_runtime_transcript,
         )
         self.profile_manager = UserProfileManager(
             prompt_manager=self.prompt_manager,
@@ -167,6 +185,20 @@ class Agent:
     def unregister_tool_hook(self, hook: ToolHook) -> None:
         self.tool_manager.unregister_hook(hook)
 
+    def record_skill_result(
+        self,
+        skill_name: str,
+        result: Any,
+        *,
+        arguments: Any = None,
+    ) -> None:
+        """Record a skill executor result for bounded prompt retention."""
+        self.memory_manager.append_skill_result(
+            skill_name,
+            result,
+            arguments=arguments,
+        )
+
     async def ainvoke(
         self,
         message: Message,
@@ -188,20 +220,29 @@ class Agent:
     ) -> ModelResponse:
         logger.info("chat start")
         self.memory_manager.compress_if_needed()
-        system_prompt = self._build_chat_system_prompt()
         request_options = options or InvokeOptions()
         todo_toolset = self._build_todo_toolset(
             user_message,
             progress_callback,
         )
-        if todo_toolset is not None:
-            request_options = self.tool_manager.merge_options(
-                request_options,
-                extra_specs=todo_toolset.specs,
-                extra_handlers=todo_toolset.handlers,
-            )
-        else:
-            request_options = self.tool_manager.merge_options(request_options)
+        request_options = self._merge_runtime_tools(
+            request_options,
+            todo_toolset,
+        )
+        system_prompt = self._build_chat_system_prompt(
+            enabled_tools=request_options.tools,
+            todo_toolset=todo_toolset,
+        )
+        request_options = replace(
+            request_options,
+            context_recovery_callback=lambda messages: self._refresh_system_message(
+                messages,
+                lambda: self._build_chat_system_prompt(
+                    enabled_tools=request_options.tools,
+                    todo_toolset=todo_toolset,
+                ),
+            ),
+        )
 
         if request_options.tools:
             logger.info("chat route=tool")
@@ -215,6 +256,11 @@ class Agent:
                     else None
                 ),
                 progress_callback=progress_callback,
+                tool_result_callback=self._record_tool_result,
+                prompt_builder=lambda: self._build_chat_system_prompt(
+                    enabled_tools=request_options.tools,
+                    todo_toolset=todo_toolset,
+                ),
             )
         else:
             logger.info("chat route=normal")
@@ -245,20 +291,29 @@ class Agent:
     ) -> Iterator[str]:
         logger.info("stream_chat start")
         self.memory_manager.compress_if_needed()
-        system_prompt = self._build_chat_system_prompt()
         request_options = options or InvokeOptions()
         todo_toolset = self._build_todo_toolset(
             user_message,
             progress_callback,
         )
-        if todo_toolset is not None:
-            request_options = self.tool_manager.merge_options(
-                request_options,
-                extra_specs=todo_toolset.specs,
-                extra_handlers=todo_toolset.handlers,
-            )
-        else:
-            request_options = self.tool_manager.merge_options(request_options)
+        request_options = self._merge_runtime_tools(
+            request_options,
+            todo_toolset,
+        )
+        system_prompt = self._build_chat_system_prompt(
+            enabled_tools=request_options.tools,
+            todo_toolset=todo_toolset,
+        )
+        request_options = replace(
+            request_options,
+            context_recovery_callback=lambda messages: self._refresh_system_message(
+                messages,
+                lambda: self._build_chat_system_prompt(
+                    enabled_tools=request_options.tools,
+                    todo_toolset=todo_toolset,
+                ),
+            ),
+        )
 
         if request_options.tools:
             logger.info("stream_chat route=tool")
@@ -272,6 +327,11 @@ class Agent:
                     else None
                 ),
                 progress_callback=progress_callback,
+                tool_result_callback=self._record_tool_result,
+                prompt_builder=lambda: self._build_chat_system_prompt(
+                    enabled_tools=request_options.tools,
+                    todo_toolset=todo_toolset,
+                ),
             )
             self._finish_chat_turn(
                 user_message=user_message,
@@ -302,19 +362,80 @@ class Agent:
             assistant_message="".join(chunks),
         )
 
-    def _build_chat_system_prompt(self) -> str:
+    def _build_chat_system_prompt(
+        self,
+        *,
+        enabled_tools: list[ToolSpec] | None = None,
+        todo_toolset: TodoToolset | None = None,
+    ) -> str:
         history_text, recent_text = (
             self.memory_manager.get_prompt_texts()
         )
-        prompt = self.prompt_manager.build_chat_system_prompt(
+        return self.prompt_manager.build_chat_system_prompt(
             history=history_text,
             recent_chat_record=recent_text,
             user_profile=self.profile_manager.format(),
+            enabled_tools=enabled_tools,
+            workspace=self.workspace_root,
+            skills_catalog=self.skills_prompt if self.skills else "",
+            operation_history=self.memory_manager.get_operation_prompt_text(),
+            todo_enabled=todo_toolset is not None,
+            delegation_enabled=(
+                todo_toolset is not None
+                and todo_toolset.delegate_handler is not None
+            ),
+            todo_state=(
+                todo_toolset.todo_list.snapshot()
+                if todo_toolset is not None
+                else None
+            ),
         )
-        return (
-            f"{prompt}\n\n"
-            "## 本地技能\n"
-            f"{self.skills_prompt}"
+
+    def _merge_runtime_tools(
+        self,
+        options: InvokeOptions,
+        todo_toolset: TodoToolset | None,
+    ) -> InvokeOptions:
+        extra_specs = list(self.skill_toolset.specs)
+        extra_handlers = dict(self.skill_toolset.handlers)
+        if todo_toolset is not None:
+            extra_specs.extend(todo_toolset.specs)
+            extra_handlers.update(todo_toolset.handlers)
+        return self.tool_manager.merge_options(
+            options,
+            extra_specs=extra_specs or None,
+            extra_handlers=extra_handlers or None,
+        )
+
+    @staticmethod
+    def _refresh_system_message(
+        messages: list[dict[str, Any]],
+        prompt_builder: Callable[[], str],
+    ) -> None:
+        for message in messages:
+            if message.get("role") == "system":
+                message["content"] = prompt_builder()
+                return
+
+    def _record_tool_result(
+        self,
+        tool_call: Any,
+        result: str,
+        round_index: int,
+    ) -> None:
+        if getattr(tool_call, "name", "") == "load_skill":
+            self.memory_manager.append_skill_result(
+                "load_skill",
+                result,
+                arguments=getattr(tool_call, "arguments", None),
+                call_id=getattr(tool_call, "id", None),
+                round_index=round_index,
+            )
+            return
+        self.memory_manager.append_tool_result(
+            tool_call,
+            result,
+            round_index,
         )
 
     def _build_todo_toolset(
@@ -335,7 +456,15 @@ class Agent:
         return todo_toolset
 
     def _build_chat_prompt(self, user_message: str) -> str:
-        system_prompt = self._build_chat_system_prompt()
+        todo_toolset = self._build_todo_toolset(user_message, None)
+        request_options = self._merge_runtime_tools(
+            InvokeOptions(),
+            todo_toolset,
+        )
+        system_prompt = self._build_chat_system_prompt(
+            enabled_tools=request_options.tools,
+            todo_toolset=todo_toolset,
+        )
         return f"{system_prompt}\n\n用户最新问题：\n{user_message}"
 
     def _finish_chat_turn(

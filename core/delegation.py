@@ -18,6 +18,9 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 _CHILD_EXCLUDED_TOOLS = {
     "todo_create",
+    "todo_claim",
+    "todo_complete",
+    "todo_block",
     "todo_update",
     "todo_list",
     "todo_delegate",
@@ -36,6 +39,7 @@ class SubtaskSummary:
     def to_dict(self) -> dict[str, Any]:
         result: dict[str, Any] = {
             "task_id": self.task_id,
+            "task": self.title,
             "title": self.title,
             "status": self.status,
             "summary": self.summary,
@@ -64,10 +68,13 @@ class SubtaskExecutor:
 
     def delegate(
         self,
-        item_id: str,
-        instructions: str,
+        item_id: str | None = None,
+        instructions: str = "",
         tool_names: list[str] | None = None,
+        *,
+        task_id: str | None = None,
     ) -> dict[str, Any]:
+        item_id = (task_id or item_id or "").strip()
         item = self.todo_list.get(item_id)
         if not instructions.strip():
             return self._finish_without_child(
@@ -84,7 +91,7 @@ class SubtaskExecutor:
             )
         except ValueError as exc:
             current_status = self.todo_list.get(item_id).status
-            if current_status in {"pending", "in_progress"}:
+            if current_status in {"pending", "in_process", "in_progress"}:
                 result = SubtaskSummary(
                     task_id=item_id,
                     title=item.title,
@@ -107,7 +114,11 @@ class SubtaskExecutor:
             "subtask_started",
             {
                 "task_id": item_id,
+                "task": item.task,
                 "title": item.title,
+                "summary": item.summary,
+                "status": item.status,
+                "dependencies": list(item.dependencies),
             },
         )
 
@@ -121,16 +132,14 @@ class SubtaskExecutor:
             summary = self._parse_summary(item_id, item.title, response)
             final_status = summary.status
             if final_status == "completed":
-                self.todo_list.update(
+                self.todo_list.complete(
                     item_id,
-                    "completed",
-                    note=summary.summary,
+                    summary=summary.summary,
                 )
             elif final_status == "blocked":
-                self.todo_list.update(
+                self.todo_list.block(
                     item_id,
-                    "blocked",
-                    note=summary.error or summary.summary,
+                    reason=summary.error or summary.summary,
                 )
             else:
                 self.todo_list.update(
@@ -138,6 +147,16 @@ class SubtaskExecutor:
                     "failed",
                     note=summary.error or summary.summary,
                 )
+            self._notify_task_update_if_unobserved(
+                item_id,
+                action=(
+                    "complete"
+                    if final_status == "completed"
+                    else "block"
+                    if final_status == "blocked"
+                    else "failed"
+                ),
+            )
 
             event_type = (
                 "subtask_finished"
@@ -151,6 +170,7 @@ class SubtaskExecutor:
             error = str(exc)
             try:
                 self.todo_list.update(item_id, "failed", note=error)
+                self._notify_task_update_if_unobserved(item_id, action="failed")
             except Exception:
                 logger.exception("failed to update subtask status item_id=%s", item_id)
             summary = SubtaskSummary(
@@ -178,7 +198,9 @@ class SubtaskExecutor:
             ready: list[dict[str, Any]] = []
             waiting: list[dict[str, Any]] = []
             for request in remaining:
-                item_id = str(request.get("item_id", ""))
+                item_id = str(
+                    request.get("task_id", request.get("item_id", ""))
+                )
                 try:
                     if self.todo_list.is_ready(item_id):
                         ready.append(request)
@@ -191,7 +213,12 @@ class SubtaskExecutor:
                 for request in waiting:
                     results.append(
                         self.delegate(
-                            str(request.get("item_id", "")),
+                            str(
+                                request.get(
+                                    "task_id",
+                                    request.get("item_id", ""),
+                                )
+                            ),
                             str(request.get("instructions", "")),
                             request.get("tool_names"),
                         )
@@ -213,10 +240,13 @@ class SubtaskExecutor:
 
     def _delegate_request(self, request: dict[str, Any]) -> dict[str, Any]:
         if request.get("_validation_error"):
-            item_id = str(request.get("item_id", ""))
+            item_id = str(
+                request.get("task_id", request.get("item_id", ""))
+            )
             item = self.todo_list.get(item_id)
             error = str(request["_validation_error"])
             self.todo_list.update(item_id, "failed", note=error)
+            self._notify_task_update_if_unobserved(item_id, action="failed")
             summary = SubtaskSummary(
                 task_id=item_id,
                 title=item.title,
@@ -227,7 +257,7 @@ class SubtaskExecutor:
             self._notify("subtask_failed", summary.to_dict())
             return summary.to_dict()
         return self.delegate(
-            str(request.get("item_id", "")),
+            str(request.get("task_id", request.get("item_id", ""))),
             str(request.get("instructions", "")),
             request.get("tool_names"),
         )
@@ -286,37 +316,55 @@ class SubtaskExecutor:
         }
         startup_dir = getattr(self.host_agent, "startup_dir", None)
         skills_dir = getattr(self.host_agent, "skills_dir", None)
+        workspace_root = getattr(self.host_agent, "workspace_root", None)
         if startup_dir is not None:
             child_kwargs["startup_dir"] = startup_dir
         if skills_dir is not None:
             child_kwargs["skills_dir"] = skills_dir
+        if workspace_root is not None:
+            child_kwargs["workspace_root"] = workspace_root
 
         child = child_agent_factory(
             **child_kwargs,
         )
+        child_skill_toolset = getattr(child, "skill_toolset", None)
+        child_specs = list(specs)
+        child_handlers = registry.handlers()
+        if child_skill_toolset is not None:
+            child_specs.extend(child_skill_toolset.specs)
+            child_handlers.update(child_skill_toolset.handlers)
         child_skills_prompt = getattr(
             child,
             "skills_prompt",
             getattr(self.host_agent, "skills_prompt", "（未发现本地技能）"),
         )
-        child_prompt = (
-            "你是一个独立子任务执行 agent。你没有主 agent 的历史消息，"
-            "也不知道主任务的其它内容。只处理下面给出的子任务。需要工具时"
-            "必须调用提供的工具。完成后只输出 JSON 对象，不要输出 Markdown："
-            '{"task_id":"%s","title":"%s","status":"completed|blocked|failed",'
+        base_prompt_builder = getattr(child, "_build_chat_system_prompt", None)
+        if callable(base_prompt_builder):
+            child_prompt = base_prompt_builder(enabled_tools=child_specs)
+        else:
+            child_prompt = (
+                "你是一个独立子任务执行 agent。你没有主 agent 的历史消息，"
+                "也不知道主任务的其它内容。只处理下面给出的子任务。需要工具时"
+                "必须调用提供的工具。"
+            )
+            child_prompt += "\n\n## 本地技能\n" + child_skills_prompt
+
+        child_prompt += (
+            "\n\n# 子任务输出协议\n"
+            "你只处理下面给出的子任务。完成后只输出 JSON 对象，不要输出 Markdown："
+            '{"task_id":"%s","task":"%s","title":"%s",'
+            '"status":"completed|blocked|failed",'
             '"summary":"简短处理摘要","artifacts":["可选产物"],"error":"可选错误"}'
-            % (item_id, title)
-            + "\n\n## 本地技能\n"
-            + child_skills_prompt
+            % (item_id, title, title)
         )
         options = InvokeOptions(
-            tools=specs or None,
-            tool_handlers=registry.handlers() or None,
+            tools=child_specs or None,
+            tool_handlers=child_handlers or None,
             max_tool_rounds=5,
             temperature=0,
             response_format={"type": "json_object"},
         )
-        if specs:
+        if child_specs:
             return child.tool_manager.chat_with_tools(
                 prompt=child_prompt,
                 user_message=instructions,
@@ -398,6 +446,26 @@ class SubtaskExecutor:
         if self.progress_callback is not None:
             self.progress_callback(event_type, data)
 
+    def _notify_task_update_if_unobserved(
+        self,
+        task_id: str,
+        *,
+        action: str,
+    ) -> None:
+        if self.todo_list.observer is not None:
+            return
+        task = self.todo_list.get(task_id)
+        self._notify(
+            "todo_updated",
+            {
+                **self.todo_list.snapshot(),
+                "action": action,
+                "updated_task_id": task_id,
+                "updated_item_id": task_id,
+                "updated_task": task.to_dict(),
+            },
+        )
+
     def _finish_without_child(
         self,
         item: Any,
@@ -407,6 +475,7 @@ class SubtaskExecutor:
         error: str,
     ) -> dict[str, Any]:
         self.todo_list.update(item.item_id, status, note=error)
+        self._notify_task_update_if_unobserved(item.item_id, action=status)
         result = SubtaskSummary(
             task_id=item.item_id,
             title=item.title,

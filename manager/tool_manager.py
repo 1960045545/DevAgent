@@ -99,10 +99,12 @@ class ToolManager:
         self,
         *,
         prompt: str,
+        prompt_builder: Callable[[], str] | None = None,
         user_message: str,
         options: InvokeOptions,
         todo_list: TodoList | None = None,
         progress_callback: Callable[[str, dict[str, Any]], None] | None = None,
+        tool_result_callback: Callable[[ToolCall, str, int], None] | None = None,
     ) -> ModelResponse:
         if not options.tool_handlers:
             raise AgentRequestError(
@@ -131,6 +133,8 @@ class ToolManager:
             for spec in options.tools or []
         }
         for round_index in range(options.max_tool_rounds):
+            if prompt_builder is not None:
+                messages[0]["content"] = prompt_builder()
             round_options = options
             if todo_list is not None and not todo_list.created:
                 round_options = replace(
@@ -239,6 +243,12 @@ class ToolManager:
                         "content": tool_result,
                     }
                 )
+                if tool_result_callback is not None:
+                    tool_result_callback(
+                        tool_call,
+                        tool_result,
+                        round_index,
+                    )
 
             # The API requires one tool result for every call in an assistant
             # message. These calls are explicitly deferred, never executed.
@@ -291,7 +301,12 @@ class ToolManager:
         deferred: dict[str, str] = {}
         seen_items: set[str] = set()
         for tool_call in candidates:
-            item_id = str(tool_call.arguments.get("item_id", ""))
+            item_id = str(
+                tool_call.arguments.get(
+                    "task_id",
+                    tool_call.arguments.get("item_id", ""),
+                )
+            )
             if item_id in seen_items:
                 deferred[tool_call.id or "unknown"] = (
                     "Deferred because the same todo item was delegated more than once."
@@ -491,9 +506,11 @@ class ToolManager:
     def _todo_continue_instruction(todo_list: TodoList) -> str:
         return (
             "You are working on a complex task. Do not provide the final answer "
-            "yet. Read the current todo state and continue the next pending "
-            "step. Mark it in_progress before work and completed only after "
-            "the work is actually finished. Current state: "
+            "yet. Read the current Task DAG and continue a ready pending task. "
+            "First call todo_claim to move pending to in_process. After the "
+            "work is actually finished call todo_complete with an execution "
+            "summary. Call todo_block with a reason when a task cannot proceed. "
+            "Current state: "
             f"{todo_list.snapshot()}"
         )
 

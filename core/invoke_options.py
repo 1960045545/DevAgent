@@ -18,3 +18,4 @@ class InvokeOptions:
     extra_body: dict[str, Any] | None = None
     extra_headers: dict[str, str] | None = None
     timeout: float | None = None
+    context_recovery_callback: Callable[[list[dict[str, Any]]], None] | None = None

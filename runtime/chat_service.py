@@ -251,7 +251,7 @@ class ChatService:
             with self._state_lock:
                 state.todos = [
                     dict(item)
-                    for item in data.get("todos", [])
+                    for item in data.get("tasks", data.get("todos", []))
                     if isinstance(item, dict)
                 ]
 

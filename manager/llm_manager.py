@@ -3,8 +3,12 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import random
 import time
-from typing import Any, Iterator
+from dataclasses import dataclass, replace
+from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
+from typing import Any, Callable, Iterator
 
 from openai import OpenAI
 
@@ -12,7 +16,12 @@ from core.invoke_options import InvokeOptions
 from core.message import Message
 from core.response import ModelResponse
 from core.tool_call import ToolCall
-from error.request_error import AgentRequestError
+from error.request_error import (
+    AgentRequestError,
+    PromptTooLongError,
+    ProviderOverloadedError,
+    RateLimitError,
+)
 from manager.model_provider_manager import (
     ModelProviderConfig,
     ModelProviderHealth,
@@ -23,7 +32,31 @@ from manager.model_provider_manager import (
 logger = logging.getLogger(__name__)
 
 
+@dataclass
+class _RecoveryState:
+    output_limit_escalated: bool = False
+    continuation_count: int = 0
+    context_compaction_attempted: bool = False
+    reactive_compaction_attempted: bool = False
+
+
+_CONTINUATION_PROMPT = (
+    "Output token limit hit. Resume directly; do not apologize or recap. "
+    "Pick up exactly where the previous answer stopped."
+)
+
+
 class LLMManager:
+    INITIAL_MAX_OUTPUT_TOKENS = 8_000
+    ESCALATED_MAX_OUTPUT_TOKENS = 64_000
+    MAX_OUTPUT_CONTINUATIONS = 3
+    MAX_RATE_LIMIT_RETRIES = 10
+    MAX_OVERLOAD_RETRIES = 3
+    BASE_RETRY_DELAY = 0.5
+    MAX_RETRY_DELAY = 32.0
+    REACTIVE_SYSTEM_MAX_CHARS = 12_000
+    REACTIVE_MESSAGE_MAX_CHARS = 8_000
+
     def __init__(
         self,
         *,
@@ -37,6 +70,8 @@ class LLMManager:
         default_headers: dict[str, str] | None = None,
         client: OpenAI | None = None,
         providers: list[ModelProviderConfig] | None = None,
+        context_compactor: Callable[[], None] | None = None,
+        context_transcript_writer: Callable[..., Any] | None = None,
     ) -> None:
         self.providers = providers or [
             ModelProviderConfig(
@@ -61,6 +96,9 @@ class LLMManager:
         self.retry_interval = retry_interval
         self.cooldown_seconds = cooldown_seconds
         self.default_headers = default_headers or {}
+        self.context_compactor = context_compactor
+        self.context_transcript_writer = context_transcript_writer
+        self._context_compaction_active = False
         self.last_success_provider_name: str | None = None
         self.last_success_model_id: str | None = None
         self.clients = self._create_clients(client)
@@ -73,6 +111,16 @@ class LLMManager:
             [provider.name for provider in self.providers],
             primary_provider.name,
         )
+
+    def set_context_recovery_callbacks(
+        self,
+        *,
+        context_compactor: Callable[[], None] | None = None,
+        context_transcript_writer: Callable[..., Any] | None = None,
+    ) -> None:
+        """Attach the agent's existing memory compression and transcript hooks."""
+        self.context_compactor = context_compactor
+        self.context_transcript_writer = context_transcript_writer
 
     async def ainvoke(
         self,
@@ -256,11 +304,7 @@ class LLMManager:
                 )
                 continue
 
-            attempts = (
-                1
-                if ModelProviderHealth.needs_probe(provider.name)
-                else self.max_retries
-            )
+            attempts = self.max_retries
             model_name = provider.model_for(purpose, override_model_id=model_id)
             logger.info(
                 "try provider name=%s purpose=%s stream=%s attempts=%d model=%s",
@@ -293,15 +337,7 @@ class LLMManager:
                     purpose,
                 )
                 return response
-            except Exception as exc:
-                if not self._is_retryable_exception(exc):
-                    logger.exception(
-                        "non-retryable error provider=%s purpose=%s",
-                        provider.name,
-                        purpose,
-                    )
-                    raise
-
+            except ProviderOverloadedError as exc:
                 last_error = exc
                 ModelProviderHealth.mark_unavailable(
                     provider.name,
@@ -315,11 +351,24 @@ class LLMManager:
                     self.cooldown_seconds,
                     exc,
                 )
+                # A provider may only be replaced after the dedicated 529
+                # retry budget is exhausted.  Do not use another provider for
+                # prompt errors, rate limits, or unrelated failures.
+                continue
+            except Exception as exc:
+                logger.exception(
+                    "non-retryable error provider=%s purpose=%s",
+                    provider.name,
+                    purpose,
+                )
+                raise
 
+        if last_error is not None:
+            raise last_error
         raise AgentRequestError(
-            "All model providers are unavailable",
-            retryable=True,
-        ) from last_error
+            "No model provider is available",
+            retryable=False,
+        )
 
     def _create_completion_for_provider(
         self,
@@ -332,9 +381,100 @@ class LLMManager:
         purpose: ModelPurpose,
         attempts: int,
     ) -> Any:
-        last_error: BaseException | None = None
+        del attempts
+        state = _RecoveryState()
+        accumulated_chunks: list[str] = []
+        current_options = self._options_with_initial_output_limit(options)
 
-        for attempt in range(1, attempts + 1):
+        while True:
+            try:
+                response = self._request_with_transient_retries(
+                    provider,
+                    messages,
+                    current_options,
+                    stream=stream,
+                    model_id=model_id,
+                    purpose=purpose,
+                )
+            except Exception as exc:
+                if self.is_prompt_too_long_error(exc):
+                    if self._recover_prompt_too_long(
+                        messages,
+                        state,
+                        current_options,
+                    ):
+                        continue
+                    raise PromptTooLongError(
+                        "prompt remains too long after context compression",
+                        retryable=False,
+                        status_code=self.extract_status_code(exc),
+                        error_code="prompt_too_long",
+                    ) from exc
+
+                if self.is_output_limit_error(exc):
+                    if not state.output_limit_escalated:
+                        state.output_limit_escalated = True
+                        current_options = replace(
+                            current_options,
+                            max_output_tokens=self.ESCALATED_MAX_OUTPUT_TOKENS,
+                        )
+                        continue
+                    raise AgentRequestError(
+                        "model stopped mid-answer after the 64K output limit",
+                        retryable=False,
+                    ) from exc
+                raise
+
+            data = self.response_to_dict(response)
+            if not self.response_stopped_by_length(data):
+                if accumulated_chunks:
+                    return self._with_accumulated_text(
+                        data,
+                        "".join(accumulated_chunks),
+                    )
+                return response
+
+            if not state.output_limit_escalated:
+                state.output_limit_escalated = True
+                current_options = replace(
+                    current_options,
+                    max_output_tokens=self.ESCALATED_MAX_OUTPUT_TOKENS,
+                )
+                # The 8K response is deliberately discarded.  Retrying with
+                # the original messages prevents duplicated or partial output.
+                continue
+
+            partial_text = self.response_text(data)
+            accumulated_chunks.append(partial_text)
+            if state.continuation_count >= self.MAX_OUTPUT_CONTINUATIONS:
+                raise AgentRequestError(
+                    "model output remained truncated after continuation recovery",
+                    retryable=False,
+                )
+
+            self._append_continuation(messages, partial_text)
+            state.continuation_count += 1
+
+    def _request_with_transient_retries(
+        self,
+        provider: ModelProviderConfig,
+        messages: list[dict[str, Any]],
+        options: InvokeOptions,
+        *,
+        stream: bool,
+        model_id: str | None,
+        purpose: ModelPurpose,
+    ) -> Any:
+        last_error: BaseException | None = None
+        rate_limit_attempts = 0
+        overload_attempts = 0
+        total_attempts = 0
+        max_total_attempts = (
+            self.MAX_RATE_LIMIT_RETRIES
+            + self.MAX_OVERLOAD_RETRIES
+        )
+        while total_attempts < max_total_attempts:
+            total_attempts += 1
             try:
                 kwargs = self.build_chat_completion_kwargs_for_messages(
                     messages,
@@ -349,41 +489,67 @@ class LLMManager:
                     provider.name
                 ].chat.completions.create(**kwargs)
             except Exception as exc:
-                if not self._is_retryable_exception(exc):
-                    logger.exception(
-                        "non-retryable provider failure name=%s purpose=%s attempt=%d",
-                        provider.name,
-                        purpose,
-                        attempt,
-                    )
+                if self.is_prompt_too_long_error(exc) or self.is_output_limit_error(exc):
                     raise
 
-                last_error = exc
-                ModelProviderHealth.record_failure(
-                    provider.name,
-                    attempt=attempt,
-                    error=exc,
-                )
-                logger.warning(
-                    "provider attempt failed name=%s purpose=%s attempt=%d/%d model=%s error=%s",
-                    provider.name,
-                    purpose,
-                    attempt,
-                    attempts,
-                    provider.model_for(purpose, override_model_id=model_id),
-                    exc,
-                )
+                if self.is_rate_limit_error(exc):
+                    last_error = exc
+                    rate_limit_attempts += 1
+                    overload_attempts = 0
+                    ModelProviderHealth.record_failure(
+                        provider.name,
+                        attempt=rate_limit_attempts,
+                        error=exc,
+                    )
+                    if rate_limit_attempts >= self.MAX_RATE_LIMIT_RETRIES:
+                        raise RateLimitError(
+                            "rate limit recovery exhausted after 10 retries",
+                            retryable=True,
+                            status_code=429,
+                            retry_after=self.extract_retry_after(exc),
+                        ) from exc
+                    time.sleep(
+                        self.retry_delay(
+                            rate_limit_attempts - 1,
+                            retry_after=self.extract_retry_after(exc),
+                        )
+                    )
+                    continue
 
-                if attempt < attempts:
-                    time.sleep(self.retry_interval)
+                if self.is_overloaded_error(exc):
+                    last_error = exc
+                    overload_attempts += 1
+                    rate_limit_attempts = 0
+                    ModelProviderHealth.record_failure(
+                        provider.name,
+                        attempt=overload_attempts,
+                        error=exc,
+                    )
+                    if overload_attempts >= self.MAX_OVERLOAD_RETRIES:
+                        raise ProviderOverloadedError(
+                            "provider remained overloaded after 3 retries",
+                            retryable=True,
+                            status_code=529,
+                            error_code="overloaded",
+                        ) from exc
+                    time.sleep(
+                        self.retry_delay(
+                            overload_attempts - 1,
+                            retry_after=self.extract_retry_after(exc),
+                        )
+                    )
+                    continue
 
-        if last_error is None:
-            raise AgentRequestError(
-                f"Provider has no available model: {provider.name}",
-                retryable=True,
-            )
+                # 408, arbitrary 5xx, connection errors and API validation
+                # failures are intentionally not folded into this policy.
+                raise
 
-        raise last_error
+        if last_error is not None:
+            raise last_error
+        raise AgentRequestError(
+            f"Provider has no available model: {provider.name}",
+            retryable=False,
+        )
 
     def _stream_with_fallback(
         self,
@@ -405,11 +571,7 @@ class LLMManager:
                 )
                 continue
 
-            attempts = (
-                1
-                if ModelProviderHealth.needs_probe(provider.name)
-                else self.max_retries
-            )
+            attempts = self.max_retries
             model_name = provider.model_for(purpose, override_model_id=model_id)
             logger.info(
                 "try provider name=%s purpose=%s stream=%s attempts=%d model=%s",
@@ -421,7 +583,7 @@ class LLMManager:
             )
 
             try:
-                first_chunk, stream = self._open_stream_for_provider(
+                chunks = self._stream_provider_with_recovery(
                     provider,
                     messages,
                     options,
@@ -429,15 +591,10 @@ class LLMManager:
                     purpose=purpose,
                     attempts=attempts,
                 )
-            except Exception as exc:
-                if not self._is_retryable_exception(exc):
-                    logger.exception(
-                        "non-retryable stream failure name=%s purpose=%s",
-                        provider.name,
-                        purpose,
-                    )
-                    raise
-
+                for chunk in chunks:
+                    yield chunk
+                return
+            except ProviderOverloadedError as exc:
                 last_error = exc
                 ModelProviderHealth.mark_unavailable(
                     provider.name,
@@ -452,34 +609,22 @@ class LLMManager:
                     exc,
                 )
                 continue
+            except Exception as exc:
+                logger.exception(
+                    "non-retryable stream failure name=%s purpose=%s",
+                    provider.name,
+                    purpose,
+                )
+                raise
 
-            ModelProviderHealth.record_success(provider.name)
-            self.last_success_provider_name = provider.name
-            self.last_success_model_id = provider.model_for(
-                purpose,
-                override_model_id=model_id,
-            )
-            logger.info(
-                "provider stream success first_chunk name=%s purpose=%s",
-                provider.name,
-                purpose,
-            )
-            yield first_chunk
-
-            for event in stream:
-                chunk = self.stream_event_content(event)
-
-                if chunk:
-                    yield chunk
-
-            return
-
+        if last_error is not None:
+            raise last_error
         raise AgentRequestError(
-            "All model providers are unavailable",
-            retryable=True,
-        ) from last_error
+            "No model provider is available",
+            retryable=False,
+        )
 
-    def _open_stream_for_provider(
+    def _stream_provider_with_recovery(
         self,
         provider: ModelProviderConfig,
         messages: list[dict[str, Any]],
@@ -488,27 +633,90 @@ class LLMManager:
         model_id: str | None,
         purpose: ModelPurpose,
         attempts: int,
-    ) -> tuple[str, Any]:
-        stream = self._create_completion_for_provider(
-            provider,
-            messages,
-            options,
-            stream=True,
-            model_id=model_id,
-            purpose=purpose,
-            attempts=attempts,
-        )
+    ) -> Iterator[str]:
+        del attempts
+        state = _RecoveryState()
+        accumulated_chunks: list[str] = []
+        current_options = self._options_with_initial_output_limit(options)
 
+        while True:
+            try:
+                stream = self._request_with_transient_retries(
+                    provider,
+                    messages,
+                    current_options,
+                    stream=True,
+                    model_id=model_id,
+                    purpose=purpose,
+                )
+                chunks, finish_reason = self._collect_stream(stream)
+            except Exception as exc:
+                if self.is_prompt_too_long_error(exc):
+                    if self._recover_prompt_too_long(
+                        messages,
+                        state,
+                        current_options,
+                    ):
+                        continue
+                    raise PromptTooLongError(
+                        "prompt remains too long after context compression",
+                        retryable=False,
+                        status_code=self.extract_status_code(exc),
+                        error_code="prompt_too_long",
+                    ) from exc
+                if self.is_output_limit_error(exc):
+                    if not state.output_limit_escalated:
+                        state.output_limit_escalated = True
+                        current_options = replace(
+                            current_options,
+                            max_output_tokens=self.ESCALATED_MAX_OUTPUT_TOKENS,
+                        )
+                        continue
+                raise
+
+            if not self.is_length_finish_reason(finish_reason):
+                final_chunks = [*accumulated_chunks, *chunks]
+                ModelProviderHealth.record_success(provider.name)
+                self.last_success_provider_name = provider.name
+                self.last_success_model_id = provider.model_for(
+                    purpose,
+                    override_model_id=model_id,
+                )
+                for chunk in final_chunks:
+                    if chunk:
+                        yield chunk
+                return
+
+            if not state.output_limit_escalated:
+                state.output_limit_escalated = True
+                current_options = replace(
+                    current_options,
+                    max_output_tokens=self.ESCALATED_MAX_OUTPUT_TOKENS,
+                )
+                continue
+
+            accumulated_chunks.extend(chunks)
+            if state.continuation_count >= self.MAX_OUTPUT_CONTINUATIONS:
+                raise AgentRequestError(
+                    "model output remained truncated after continuation recovery",
+                    retryable=False,
+                )
+            self._append_continuation(messages, "".join(chunks))
+            state.continuation_count += 1
+
+    @staticmethod
+    def _collect_stream(stream: Any) -> tuple[list[str], str | None]:
+        chunks: list[str] = []
+        finish_reason: str | None = None
         for event in stream:
-            chunk = self.stream_event_content(event)
-
+            data = LLMManager.response_to_dict(event)
+            choices = data.get("choices") or []
+            if choices:
+                finish_reason = choices[0].get("finish_reason") or finish_reason
+            chunk = LLMManager.stream_event_content(event)
             if chunk:
-                return chunk, stream
-
-        raise AgentRequestError(
-            f"Provider stream returned no content: {provider.name}",
-            retryable=True,
-        )
+                chunks.append(chunk)
+        return chunks, finish_reason
 
     def build_chat_completion_kwargs(
         self,
@@ -581,27 +789,310 @@ class LLMManager:
 
         return kwargs
 
+    @classmethod
+    def _is_retryable_exception(cls, exc: BaseException) -> bool:
+        """Compatibility helper: only the two transient policies are retryable."""
+        return cls.is_rate_limit_error(exc) or cls.is_overloaded_error(exc)
+
+    @classmethod
+    def is_rate_limit_error(cls, exc: BaseException) -> bool:
+        return cls.extract_status_code(exc) == 429
+
+    @classmethod
+    def is_overloaded_error(cls, exc: BaseException) -> bool:
+        return cls.extract_status_code(exc) == 529
+
+    @classmethod
+    def is_prompt_too_long_error(cls, exc: BaseException) -> bool:
+        code = cls.extract_error_code(exc)
+        text = str(exc).lower()
+        return code in {
+            "prompt_too_long",
+            "context_length_exceeded",
+            "context_window_exceeded",
+            "input_too_long",
+        } or any(
+            marker in text
+            for marker in (
+                "prompt_too_long",
+                "prompt too long",
+                "context length exceeded",
+                "maximum context length",
+                "input is too long",
+                "too many tokens",
+            )
+        )
+
+    @classmethod
+    def is_output_limit_error(cls, exc: BaseException) -> bool:
+        code = cls.extract_error_code(exc)
+        text = str(exc).lower()
+        return code in {"max_tokens", "max_completion_tokens", "length"} or any(
+            marker in text
+            for marker in (
+                "model stopped mid-answer",
+                "model stopped mid answer",
+                "output token limit",
+                "maximum output tokens reached",
+                "max completion tokens reached",
+                "finish_reason: length",
+            )
+        )
+
     @staticmethod
-    def _is_retryable_exception(exc: BaseException) -> bool:
-        retryable = getattr(exc, "retryable", None)
-
-        if retryable is not None:
-            return bool(retryable)
-
+    def extract_status_code(exc: BaseException) -> int | None:
         status_code = getattr(exc, "status_code", None)
         response = getattr(exc, "response", None)
-
         if status_code is None and response is not None:
             status_code = getattr(response, "status_code", None)
+        if isinstance(status_code, int):
+            return status_code
+        if isinstance(status_code, str) and status_code.isdigit():
+            return int(status_code)
+        return None
 
-        if status_code is None:
-            return True
+    @classmethod
+    def extract_error_code(cls, exc: BaseException) -> str | None:
+        for candidate in (
+            getattr(exc, "code", None),
+            getattr(exc, "error_code", None),
+        ):
+            if isinstance(candidate, str):
+                return candidate.lower()
 
-        return (
-            status_code == 408
-            or status_code == 429
-            or status_code >= 500
+        body = getattr(exc, "body", None)
+        if isinstance(body, dict):
+            error = body.get("error") or body
+            if isinstance(error, dict):
+                code = error.get("code") or error.get("type")
+                if isinstance(code, str):
+                    return code.lower()
+
+        return None
+
+    @classmethod
+    def extract_retry_after(cls, exc: BaseException) -> float | None:
+        direct_value = getattr(exc, "retry_after", None)
+        if isinstance(direct_value, (int, float)):
+            return max(0.0, float(direct_value))
+
+        headers = getattr(exc, "headers", None)
+        response = getattr(exc, "response", None)
+        if headers is None and response is not None:
+            headers = getattr(response, "headers", None)
+        if headers is None:
+            return None
+
+        value = None
+        if hasattr(headers, "get"):
+            value = headers.get("retry-after") or headers.get("Retry-After")
+        if value is None:
+            return None
+        try:
+            return max(0.0, float(value))
+        except (TypeError, ValueError):
+            try:
+                target = parsedate_to_datetime(str(value))
+                if target.tzinfo is None:
+                    target = target.replace(tzinfo=timezone.utc)
+                return max(
+                    0.0,
+                    (target - datetime.now(timezone.utc)).total_seconds(),
+                )
+            except (TypeError, ValueError, OverflowError):
+                return None
+
+    @classmethod
+    def retry_delay(
+        cls,
+        attempt: int,
+        *,
+        retry_after: float | None = None,
+    ) -> float:
+        if retry_after is not None:
+            return retry_after
+        base = min(
+            cls.BASE_RETRY_DELAY * (2 ** max(0, attempt)),
+            cls.MAX_RETRY_DELAY,
         )
+        return base + random.uniform(0.0, base * 0.25)
+
+    def _options_with_initial_output_limit(
+        self,
+        options: InvokeOptions,
+    ) -> InvokeOptions:
+        if options.max_output_tokens is not None:
+            return options
+        return replace(
+            options,
+            max_output_tokens=self.INITIAL_MAX_OUTPUT_TOKENS,
+        )
+
+    def _recover_prompt_too_long(
+        self,
+        messages: list[dict[str, Any]],
+        state: _RecoveryState,
+        options: InvokeOptions,
+    ) -> bool:
+        if not state.context_compaction_attempted:
+            state.context_compaction_attempted = True
+            self._run_context_compactor()
+            if options.context_recovery_callback is not None:
+                try:
+                    options.context_recovery_callback(messages)
+                except Exception:
+                    logger.exception("context prompt rebuild failed")
+            if (
+                self.context_compactor is not None
+                or options.context_recovery_callback is not None
+            ):
+                return True
+        if not state.reactive_compaction_attempted:
+            state.reactive_compaction_attempted = True
+            self._reactive_compact_messages(messages)
+            return True
+        return False
+
+    def _run_context_compactor(self) -> None:
+        if self.context_compactor is None or self._context_compaction_active:
+            return
+        self._context_compaction_active = True
+        try:
+            self.context_compactor()
+        except Exception:
+            logger.exception("context compaction recovery failed")
+        finally:
+            self._context_compaction_active = False
+
+    def _reactive_compact_messages(
+        self,
+        messages: list[dict[str, Any]],
+    ) -> None:
+        if self.context_transcript_writer is not None:
+            try:
+                self.context_transcript_writer(
+                    messages,
+                    reason="reactive_prompt_compact",
+                )
+            except Exception:
+                logger.exception("failed to save reactive context transcript")
+
+        system_message = next(
+            (message for message in messages if message.get("role") == "system"),
+            None,
+        )
+        user_messages = [
+            message
+            for message in messages
+            if message.get("role") == "user"
+        ]
+        latest_user = next(
+            (
+                message
+                for message in reversed(user_messages)
+                if message.get("content") != _CONTINUATION_PROMPT
+            ),
+            user_messages[-1] if user_messages else None,
+        )
+        compacted: list[dict[str, Any]] = []
+        if system_message is not None:
+            compacted.append(
+                self._compact_message_content(
+                    system_message,
+                    self.REACTIVE_SYSTEM_MAX_CHARS,
+                )
+            )
+        if latest_user is not None:
+            compacted.append(
+                self._compact_message_content(
+                    latest_user,
+                    self.REACTIVE_MESSAGE_MAX_CHARS,
+                )
+            )
+        if not compacted and messages:
+            compacted.append(
+                self._compact_message_content(
+                    messages[-1],
+                    self.REACTIVE_MESSAGE_MAX_CHARS,
+                )
+            )
+        messages[:] = compacted
+
+    @staticmethod
+    def _compact_message_content(
+        message: dict[str, Any],
+        max_chars: int,
+    ) -> dict[str, Any]:
+        compacted = {
+            key: value
+            for key, value in message.items()
+            if key in {"role", "content", "name"}
+        }
+        content = compacted.get("content")
+        if isinstance(content, str) and len(content) > max_chars:
+            head_chars = max_chars * 2 // 3
+            tail_chars = max_chars - head_chars
+            compacted["content"] = (
+                content[:head_chars]
+                + "\n...[reactively compacted]...\n"
+                + content[-tail_chars:]
+            )
+        return compacted
+
+    @staticmethod
+    def response_text(data: dict[str, Any]) -> str:
+        choices = data.get("choices") or []
+        if not choices:
+            return ""
+        return str((choices[0].get("message") or {}).get("content") or "")
+
+    @classmethod
+    def response_stopped_by_length(cls, data: dict[str, Any]) -> bool:
+        choices = data.get("choices") or []
+        if not choices:
+            return False
+        return cls.is_length_finish_reason(choices[0].get("finish_reason"))
+
+    @staticmethod
+    def is_length_finish_reason(reason: Any) -> bool:
+        if not isinstance(reason, str):
+            return False
+        return reason.lower() in {
+            "length",
+            "max_tokens",
+            "max_completion_tokens",
+            "model_stopped_mid_answer",
+        }
+
+    @staticmethod
+    def _append_continuation(
+        messages: list[dict[str, Any]],
+        partial_text: str,
+    ) -> None:
+        messages.append(
+            {
+                "role": "assistant",
+                "content": partial_text,
+            }
+        )
+        messages.append(
+            {
+                "role": "user",
+                "content": _CONTINUATION_PROMPT,
+            }
+        )
+
+    @classmethod
+    def _with_accumulated_text(
+        cls,
+        data: dict[str, Any],
+        accumulated_text: str,
+    ) -> dict[str, Any]:
+        choices = data.get("choices") or []
+        if choices:
+            message = choices[0].setdefault("message", {})
+            message["content"] = accumulated_text + (message.get("content") or "")
+        return data
 
     @staticmethod
     def assistant_message_from_response(
