@@ -40,24 +40,43 @@ class QwenEmbeddingProvider:
         if not texts:
             return []
         model = self._ensure_loaded()
-        embeddings = model.encode(
-            list(texts),
-            batch_size=self.batch_size,
-            normalize_embeddings=True,
-            convert_to_numpy=True,
-            show_progress_bar=False,
-        )
+        encode_document = getattr(model, "encode_document", None)
+        if callable(encode_document):
+            embeddings = encode_document(
+                list(texts),
+                batch_size=self.batch_size,
+                normalize_embeddings=True,
+                convert_to_numpy=True,
+                show_progress_bar=False,
+            )
+        else:
+            embeddings = model.encode(
+                list(texts),
+                batch_size=self.batch_size,
+                normalize_embeddings=True,
+                convert_to_numpy=True,
+                show_progress_bar=False,
+            )
         return embeddings.tolist()
 
     def embed_query(self, text: str) -> list[float]:
         model = self._ensure_loaded()
-        embedding = model.encode(
-            text,
-            prompt_name="query",
-            normalize_embeddings=True,
-            convert_to_numpy=True,
-            show_progress_bar=False,
-        )
+        encode_query = getattr(model, "encode_query", None)
+        if callable(encode_query):
+            embedding = encode_query(
+                text,
+                normalize_embeddings=True,
+                convert_to_numpy=True,
+                show_progress_bar=False,
+            )
+        else:
+            embedding = model.encode(
+                text,
+                prompt_name="query",
+                normalize_embeddings=True,
+                convert_to_numpy=True,
+                show_progress_bar=False,
+            )
         return embedding.tolist()
 
     def _ensure_loaded(self) -> Any:

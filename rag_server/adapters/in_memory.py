@@ -27,10 +27,17 @@ def _matches(
 ) -> bool:
     if not filters:
         return True
-    return all(
-        metadata.get(key) == expected
-        for key, expected in filters.items()
-    )
+    for key, expected in filters.items():
+        actual = metadata.get(key)
+        if isinstance(expected, (list, tuple, set, frozenset)):
+            if isinstance(actual, (list, tuple, set, frozenset)):
+                if not set(actual).intersection(expected):
+                    return False
+            elif actual not in expected:
+                return False
+        elif actual != expected:
+            return False
+    return True
 
 
 class HashEmbeddingProvider:

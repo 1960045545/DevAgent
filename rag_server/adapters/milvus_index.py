@@ -194,18 +194,33 @@ class MilvusVectorIndex:
                 raise ValueError(
                     f"Milvus filter field is not supported: {key}",
                 )
-            if isinstance(value, bool):
-                literal = "true" if value else "false"
-            elif isinstance(value, (int, float)):
-                literal = str(value)
-            else:
-                escaped = str(value).replace("\\", "\\\\").replace(
-                    '"',
-                    '\\"',
-                )
-                literal = f'"{escaped}"'
+            if isinstance(value, (list, tuple, set, frozenset)):
+                literals = [
+                    MilvusVectorIndex._filter_literal(item)
+                    for item in value
+                ]
+                if not literals:
+                    expressions.append("false")
+                    continue
+                expressions.append(f"{key} in [{', '.join(literals)}]")
+                continue
+            literal = MilvusVectorIndex._filter_literal(value)
             expressions.append(f"{key} == {literal}")
         return " and ".join(expressions)
+
+    @staticmethod
+    def _filter_literal(value: object) -> str:
+        if isinstance(value, bool):
+            literal = "true" if value else "false"
+        elif isinstance(value, (int, float)):
+            literal = str(value)
+        else:
+            escaped = str(value).replace("\\", "\\\\").replace(
+                '"',
+                '\\"',
+            )
+            literal = f'"{escaped}"'
+        return literal
 
     def _build_client(self) -> Any:
         try:

@@ -31,6 +31,12 @@ KNOWLEDGE_SEARCH_SPEC = ToolSpec(
                 "type": ["string", "null"],
                 "description": "Tenant scope used for access filtering.",
             },
+            "route": {
+                "type": "string",
+                "enum": ["hybrid", "keyword", "vector"],
+                "default": "hybrid",
+                "description": "Retrieval channel selection.",
+            },
         },
         "required": ["query"],
         "additionalProperties": False,
@@ -42,17 +48,25 @@ KNOWLEDGE_SEARCH_SPEC = ToolSpec(
 
 def make_knowledge_search_handler(
     service: RagService,
+    *,
+    permission_ids: list[str] | None = None,
 ) -> Callable[..., dict[str, Any]]:
     def knowledge_search(
         query: str,
         top_k: int = 3,
         tenant_id: str | None = None,
+        route: str | None = None,
     ) -> dict[str, Any]:
-        filters = None if tenant_id is None else {"tenant_id": tenant_id}
+        filters: dict[str, object] = {}
+        if tenant_id is not None:
+            filters["tenant_id"] = tenant_id
+        if permission_ids is not None:
+            filters["permission_ids"] = permission_ids
         return service.search(
             query=query,
             top_k=top_k,
-            filters=filters,
+            filters=filters or None,
+            route=route,
         ).to_dict()
 
     return knowledge_search
@@ -61,8 +75,13 @@ def make_knowledge_search_handler(
 def register_rag_tools(
     registry: ToolRegistry,
     service: RagService,
+    *,
+    permission_ids: list[str] | None = None,
 ) -> None:
     registry.register(
         KNOWLEDGE_SEARCH_SPEC,
-        make_knowledge_search_handler(service),
+        make_knowledge_search_handler(
+            service,
+            permission_ids=permission_ids,
+        ),
     )

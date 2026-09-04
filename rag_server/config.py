@@ -63,6 +63,7 @@ class RagSettings:
 
     chunk_size: int = 800
     chunk_overlap: int = 120
+    chunk_strategy: str = "text"
 
     keyword_top_k: int = 30
     vector_top_k: int = 30
@@ -156,6 +157,11 @@ class RagSettings:
                 "RAG_CHUNK_OVERLAP",
                 defaults.chunk_overlap,
             ),
+            chunk_strategy=_get(
+                values,
+                "RAG_CHUNK_STRATEGY",
+                defaults.chunk_strategy,
+            ).lower(),
             keyword_top_k=_get_int(
                 values,
                 "RAG_KEYWORD_TOP_K",
@@ -218,6 +224,10 @@ class RagSettings:
             raise ValueError("chunk_overlap must not be negative")
         if self.chunk_overlap >= self.chunk_size:
             raise ValueError("chunk_overlap must be smaller than chunk_size")
+        if self.chunk_strategy not in {"text", "markdown"}:
+            raise ValueError(
+                "chunk_strategy must be one of: text, markdown",
+            )
         if self.embedding_dimension < 0:
             raise ValueError("embedding_dimension must not be negative")
         if self.embedding_batch_size <= 0:
@@ -234,6 +244,8 @@ class RagSettings:
             raise ValueError("final_top_k must be greater than zero")
         if self.rrf_k <= 0:
             raise ValueError("rrf_k must be greater than zero")
+        if self.rerank_threshold is not None and not 0 <= self.rerank_threshold <= 1:
+            raise ValueError("rerank_threshold must be between zero and one")
         if self.reranker_batch_size <= 0:
             raise ValueError("reranker_batch_size must be greater than zero")
         if self.reranker_max_length <= 0:

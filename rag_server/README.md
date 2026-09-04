@@ -8,6 +8,9 @@ This package contains the RAG application layer for AgentDemo.
 - `ports.py`: interfaces for embeddings, MySQL metadata, Elasticsearch,
   Milvus, and reranking.
 - `chunker.py`: dependency-free first-pass text chunker.
+- `loaders.py`: safe local text/Markdown/HTML/JSON/CSV to document adapters.
+- `query.py`: optional query rewrite, multi-query expansion, and route selection.
+- `evaluation.py`: offline Recall, Precision, MRR, and nDCG evaluation helpers.
 - `fusion.py`: reciprocal rank fusion for keyword and vector results.
 - `service.py`: ingestion and retrieval orchestration.
 - `adapters/in_memory.py`: deterministic local implementation for smoke tests.
@@ -18,6 +21,31 @@ This package contains the RAG application layer for AgentDemo.
 - `adapters/qwen_reranker.py`: Qwen3 reranker adapter.
 - `tools.py`: `knowledge_search` tool definition and registration helper.
 - `config.py`: environment-backed runtime settings.
+
+## Retrieval workflow
+
+The default path is:
+
+```text
+DocumentLoader -> Chunker -> Embedding -> MySQL metadata
+                                      -> Elasticsearch BM25
+                                      -> Milvus cosine search
+                                      -> RRF -> Qwen reranker -> threshold -> Top-K
+```
+
+`RAG_CHUNK_STRATEGY=markdown` enables heading-aware chunks. Each search uses
+one original query by default. Inject `QueryPlanner(rewriter=..., router=...)`
+when query rewriting, multi-query retrieval, or channel routing is needed.
+Supported routes are `hybrid`, `keyword`, and `vector`.
+
+Search responses include a serializable `query_plan` and `trace` with channel
+candidate counts and fusion/reranking counts. These fields are intended for
+observability and retrieval tuning, not for model-generated facts.
+
+`permission_ids` is applied after metadata hydration. Empty document
+permissions are public; a restricted chunk is returned only when the caller's
+permission set intersects the chunk permissions. Tenant/document/version
+filters are pushed to both search backends.
 
 The application reads one runtime configuration file:
 `D:\python_program\agentDemo\.env`. The root `.env.example` is a template,
@@ -42,6 +70,25 @@ service.ingest(
 
 print(service.search("Where are vectors stored?").to_dict())
 ```
+
+## Local loading and evaluation
+
+```python
+from rag_server.evaluation import EvaluationCase, evaluate_retrieval
+from rag_server.loaders import LocalDocumentLoader
+
+loader = LocalDocumentLoader("./knowledge")
+batch = service.ingest_many(loader.iter_documents(), continue_on_error=True)
+
+report = evaluate_retrieval(
+    service.search,
+    [EvaluationCase("Where are vectors stored?", frozenset({"doc-001:1:0"}))],
+)
+print(report.to_dict())
+```
+
+The loader only reads caller-provided files. It does not include tutorial
+content or automatically index a directory.
 
 ## Production service
 

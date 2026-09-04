@@ -14,10 +14,21 @@ from rag_server.adapters import (
     InMemoryVectorIndex,
 )
 from rag_server.chunker import TextChunker
+from rag_server.chunker import MarkdownChunker
+from rag_server.evaluation import (
+    EvaluationCase,
+    evaluate_retrieval,
+    ndcg_at_k,
+    precision_at_k,
+    recall_at_k,
+    reciprocal_rank,
+)
 from rag_server.bootstrap import build_in_memory_service
 from rag_server.config import RagSettings
 from rag_server.fusion import rrf_fuse
-from rag_server.prompt import build_grounded_prompt
+from rag_server.loaders import LocalDocumentLoader
+from rag_server.prompt import build_grounded_messages, build_grounded_prompt
+from rag_server.query import QueryPlanner
 from rag_server.schemas import DocumentRecord, SearchHit
 from rag_server.service import RagService
 
@@ -42,6 +53,10 @@ class RagServerTests(unittest.TestCase):
         self.assertEqual(settings.mysql_port, 3307)
         self.assertEqual(settings.chunk_size, 400)
         self.assertEqual(settings.rerank_threshold, 0.8)
+
+    def test_settings_rejects_rerank_threshold_outside_probability_range(self) -> None:
+        with self.assertRaises(ValueError):
+            RagSettings.from_env({"RAG_RERANK_THRESHOLD": "1.1"})
 
     def test_settings_empty_mapping_does_not_read_process_environment(self) -> None:
         settings = RagSettings.from_env({})
@@ -137,6 +152,7 @@ class RagServerTests(unittest.TestCase):
         self.assertEqual(result.chunk_count, 1)
         self.assertTrue(response.has_evidence)
         self.assertEqual(response.hits[0].doc_id, "doc-001")
+        self.assertEqual(response.hits[0].rank, 1)
 
     def test_reingest_replaces_old_chunks(self) -> None:
         service = build_in_memory_service(
@@ -210,6 +226,139 @@ class RagServerTests(unittest.TestCase):
 
         self.assertIn("[证据 1]", prompt)
         self.assertIn(response.hits[0].content, prompt)
+
+    def test_markdown_chunker_preserves_heading_path(self) -> None:
+        chunker = MarkdownChunker(chunk_size=80, chunk_overlap=10)
+        chunks = chunker.split_with_metadata(
+            "# Guide\n\nIntroduction.\n\n## Install\n\nRun the installer."
+        )
+
+        self.assertEqual(len(chunks), 2)
+        self.assertEqual(chunks[0].metadata["heading_path"], "Guide")
+        self.assertEqual(
+            chunks[1].metadata["heading_path"],
+            "Guide > Install",
+        )
+
+    def test_local_loader_converts_files_and_skips_runtime_directories(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "guide.md").write_text(
+                "# Guide\n\nUse Milvus.",
+                encoding="utf-8",
+            )
+            (root / ".git").mkdir()
+            (root / ".git" / "ignored.md").write_text("secret", encoding="utf-8")
+            loader = LocalDocumentLoader(root)
+
+            documents = list(loader.iter_documents())
+            self.assertEqual(len(documents), 1)
+            self.assertEqual(documents[0].source_uri, "guide.md")
+            self.assertEqual(documents[0].source_type, "md")
+            self.assertEqual(documents[0].metadata["extension"], ".md")
+
+            with self.assertRaises(ValueError):
+                loader.load("../outside.md")
+
+    def test_query_planner_rewrites_deduplicates_and_routes(self) -> None:
+        planner = QueryPlanner(
+            rewriter=lambda query: [query, "semantic " + query, "third"],
+            router=lambda _query: "keyword",
+            max_queries=2,
+        )
+
+        plan = planner.build("  original question  ")
+
+        self.assertEqual(plan.route, "keyword")
+        self.assertEqual(plan.queries, ("original question", "semantic original question"))
+        self.assertTrue(plan.rewrite_applied)
+
+    def test_search_route_and_permission_filter_are_reported(self) -> None:
+        service = build_in_memory_service(
+            RagSettings(
+                embedding_dimension=32,
+                keyword_top_k=10,
+                vector_top_k=10,
+                rerank_top_k=10,
+            ),
+        )
+        service.ingest(
+            DocumentRecord(
+                doc_id="public",
+                title="Public",
+                content="Milvus vector store",
+            ),
+        )
+        service.ingest(
+            DocumentRecord(
+                doc_id="restricted",
+                title="Restricted",
+                content="Milvus vector store private",
+                permission_ids=("admin",),
+            ),
+        )
+
+        response = service.search(
+            "Milvus vector",
+            route="keyword",
+            filters={"permission_ids": []},
+        )
+
+        self.assertEqual(response.query_plan.route, "keyword")
+        self.assertEqual(response.trace.route, "keyword")
+        self.assertEqual(response.trace.vector_candidates, 0)
+        self.assertTrue(all(hit.doc_id == "public" for hit in response.hits))
+
+    def test_grounded_messages_split_instructions_from_evidence(self) -> None:
+        hit = SearchHit(
+            chunk_id="chunk-1",
+            doc_id="doc-1",
+            title="Guide",
+            content="Milvus stores vectors.",
+        )
+
+        messages = build_grounded_messages("Where are vectors?", [hit])
+
+        self.assertEqual(messages[0]["role"], "system")
+        self.assertEqual(messages[1]["role"], "user")
+        self.assertIn("[证据 1]", messages[1]["content"])
+
+    def test_grounded_messages_explain_when_evidence_is_missing(self) -> None:
+        messages = build_grounded_messages("Where are vectors?", [])
+
+        self.assertIn("没有检索到可用的知识库证据", messages[1]["content"])
+
+    def test_retrieval_evaluation_reports_standard_metrics(self) -> None:
+        retrieved = ["a", "b", "c"]
+        relevant = {"b", "d"}
+        self.assertEqual(recall_at_k(retrieved, relevant, 2), 0.5)
+        self.assertEqual(precision_at_k(retrieved, relevant, 2), 0.5)
+        self.assertEqual(reciprocal_rank(retrieved, relevant, k=3), 0.5)
+        self.assertGreater(ndcg_at_k(retrieved, relevant, 3), 0.0)
+
+        report = evaluate_retrieval(
+            lambda _query, top_k, filters=None: {
+                "results": [{"chunk_id": "b"}, {"chunk_id": "a"}],
+            },
+            [EvaluationCase("question", frozenset({"b"}), case_id="case-1")],
+            ks=(1, 2),
+        )
+        self.assertEqual(report.aggregate["recall@1"], 1.0)
+        self.assertEqual(report.to_dict()["case_count"], 1)
+
+    def test_batch_ingest_can_continue_after_one_document_fails(self) -> None:
+        service = build_in_memory_service(RagSettings(embedding_dimension=16))
+        report = service.ingest_many(
+            [
+                DocumentRecord("ok", "OK", "usable content"),
+                DocumentRecord("bad", "Bad", ""),
+            ],
+            continue_on_error=True,
+        )
+
+        self.assertEqual(report.succeeded, 1)
+        self.assertEqual(report.failed, 1)
+        self.assertEqual(report.results[1].error, "document content must not be empty")
 
 
 if __name__ == "__main__":

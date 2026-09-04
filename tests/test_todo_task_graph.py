@@ -104,6 +104,42 @@ class TaskGraphTests(unittest.TestCase):
         self.assertEqual(todo.get("todo-1").status, "in_process")
         self.assertEqual(todo.items[0].status, "in_progress")
 
+    def test_claim_next_requires_unowned_ready_task_and_sets_owner(self) -> None:
+        todo = TodoList()
+        todo.create(
+            [
+                "First",
+                {"task": "Second", "dependencies": ["todo-1"]},
+            ]
+        )
+
+        first = todo.claim_next("worker-a")
+        self.assertIsNotNone(first)
+        self.assertEqual(first["owner"], "worker-a")
+        self.assertFalse(todo.can_start("todo-2"))
+
+        with self.assertRaises(ValueError):
+            todo.claim("todo-1", owner="worker-b")
+
+        todo.complete("todo-1", "first finished")
+        second = todo.claim_next("worker-b")
+        self.assertEqual(second["task_id"], "todo-2")
+        self.assertEqual(todo.get("todo-2").owner, "worker-b")
+
+    def test_concurrent_claim_next_assigns_distinct_tasks(self) -> None:
+        todo = TodoList()
+        todo.create(["First", "Second"])
+
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            claimed = list(executor.map(todo.claim_next, ["worker-a", "worker-b"]))
+
+        claimed_ids = [task["task_id"] for task in claimed if task is not None]
+        self.assertEqual(sorted(claimed_ids), ["todo-1", "todo-2"])
+        self.assertEqual(
+            {todo.get(task_id).owner for task_id in claimed_ids},
+            {"worker-a", "worker-b"},
+        )
+
     def test_toolset_registers_explicit_actions(self) -> None:
         names = {spec.name for spec in TodoToolset().specs}
         self.assertTrue({"todo_claim", "todo_complete", "todo_block"}.issubset(names))

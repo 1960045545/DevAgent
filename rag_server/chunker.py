@@ -1,6 +1,24 @@
 from __future__ import annotations
 
 import re
+from dataclasses import dataclass, field
+from typing import Protocol
+
+
+@dataclass(frozen=True, slots=True)
+class ChunkedText:
+    """Text plus chunk-local metadata produced by a chunking strategy."""
+
+    content: str
+    metadata: dict[str, object] = field(default_factory=dict)
+
+
+class Chunker(Protocol):
+    def split(self, text: str) -> list[str]:
+        ...
+
+    def split_with_metadata(self, text: str) -> list[ChunkedText]:
+        ...
 
 
 class TextChunker:
@@ -60,6 +78,9 @@ class TextChunker:
 
         return [chunk for chunk in chunks if chunk]
 
+    def split_with_metadata(self, text: str) -> list[ChunkedText]:
+        return [ChunkedText(content=chunk) for chunk in self.split(text)]
+
     @staticmethod
     def _normalize(text: str) -> str:
         return re.sub(r"[ \t]+", " ", text.replace("\r\n", "\n")).strip()
@@ -103,3 +124,51 @@ class TextChunker:
         if not right:
             return left
         return f"{left} {right}".strip()
+
+
+class MarkdownChunker(TextChunker):
+    """Chunk Markdown by heading sections while retaining heading paths."""
+
+    _heading_pattern = re.compile(
+        r"^\s{0,3}(#{1,6})\s+(.+?)\s*#*\s*$",
+        flags=re.MULTILINE,
+    )
+
+    def split_with_metadata(self, text: str) -> list[ChunkedText]:
+        normalized = self._normalize(text)
+        if not normalized:
+            return []
+
+        sections: list[tuple[str, str]] = []
+        headings: list[str] = []
+        matches = list(self._heading_pattern.finditer(normalized))
+        if not matches:
+            sections = [(normalized, "")]
+        else:
+            prefix = normalized[: matches[0].start()].strip()
+            if prefix:
+                sections.append((prefix, ""))
+            for index, match in enumerate(matches):
+                level = len(match.group(1))
+                heading = match.group(2).strip()
+                headings = headings[: level - 1] + [heading]
+                end = (
+                    matches[index + 1].start()
+                    if index + 1 < len(matches)
+                    else len(normalized)
+                )
+                section = normalized[match.start():end].strip()
+                if section:
+                    sections.append((section, " > ".join(headings)))
+
+        result: list[ChunkedText] = []
+        for section, heading_path in sections:
+            for chunk in TextChunker.split(self, section):
+                metadata: dict[str, object] = {}
+                if heading_path:
+                    metadata["heading_path"] = heading_path
+                result.append(ChunkedText(chunk, metadata))
+        return result
+
+    def split(self, text: str) -> list[str]:
+        return [item.content for item in self.split_with_metadata(text)]

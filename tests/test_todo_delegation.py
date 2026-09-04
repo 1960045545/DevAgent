@@ -8,13 +8,15 @@ from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
 from unittest.mock import Mock
 
-from core.delegation import SubtaskExecutor
+from core.delegation import AutonomousTaskWorker, SubtaskExecutor
 from core.invoke_options import InvokeOptions
 from core.response import ModelResponse
+from core.subagent_communication import SubagentCommunication
 from core.tool_call import ToolCall
 from core.tool_registry import ToolRegistry
 from core.tool_space import ToolSpec
 from core.todo import TodoList, TodoToolset
+from manager.llm_manager import LLMManager
 from manager.tool_manager import ToolManager
 from runtime.chat_service import ChatService
 from runtime.event import EventType
@@ -28,10 +30,21 @@ class FakeChildAgent:
         self.llm_manager = SimpleNamespace(
             invoke_messages=self.invoke_messages,
         )
-        self.tool_manager = SimpleNamespace()
+        self.tool_manager = SimpleNamespace(
+            chat_with_tools=self.chat_with_tools,
+        )
 
     def invoke_messages(self, messages, **_kwargs):
         self.messages.append(messages)
+        return ModelResponse(text=self.response_text)
+
+    def chat_with_tools(self, **kwargs):
+        self.messages.append(
+            [
+                {"role": "system", "content": kwargs["prompt"]},
+                {"role": "user", "content": kwargs["user_message"]},
+            ]
+        )
         return ModelResponse(text=self.response_text)
 
 
@@ -50,7 +63,7 @@ class FakeToolLLM:
 
     @staticmethod
     def parse_chat_response(data):
-        return ModelResponse(**data)
+        return LLMManager.parse_chat_response(data)
 
     @staticmethod
     def assistant_message_from_response(data):
@@ -427,6 +440,265 @@ class TodoDelegationTests(unittest.TestCase):
         )
 
         self.assertEqual(state.events[-1].event_type, EventType.SUBTASK_DEFERRED)
+
+    def test_autonomous_worker_claims_board_task_and_exits_after_idle_timeout(self) -> None:
+        with self.subTest("worker claims and executes"):
+            from tempfile import TemporaryDirectory
+
+            with TemporaryDirectory() as directory:
+                todo_list = TodoList()
+                todo_list.create(["Follow-up task"])
+                communication = SubagentCommunication(
+                    directory,
+                    request_id="autonomous-board",
+                )
+                host = self._host_with_child_response(
+                    json.dumps(
+                        {
+                            "status": "completed",
+                            "summary": "follow-up finished",
+                        }
+                    )
+                )
+                events: list[tuple[str, dict]] = []
+                executor = SubtaskExecutor(
+                    host,
+                    todo_list,
+                    progress_callback=lambda event_type, data: events.append(
+                        (event_type, data)
+                    ),
+                    child_agent_factory=host.child_factory,
+                    communication=communication,
+                    autonomous_poll_interval=0.01,
+                    autonomous_idle_timeout=0.05,
+                )
+                worker = AutonomousTaskWorker(
+                    executor,
+                    "worker-a",
+                    poll_interval=0.01,
+                    idle_timeout=0.05,
+                )
+                worker.start()
+                worker.join(timeout=1)
+
+                self.assertFalse(worker.is_alive)
+                self.assertEqual(todo_list.get("todo-1").status, "completed")
+                self.assertEqual(todo_list.get("todo-1").owner, "worker-a")
+                claimed = [
+                    data
+                    for event_type, data in events
+                    if event_type == "autonomous_task_claimed"
+                ]
+                self.assertEqual(claimed[0]["source"], "task_board")
+                self.assertEqual(claimed[0]["task_id"], "todo-1")
+                self.assertEqual(
+                    events[-1][0],
+                    "autonomous_shutdown",
+                )
+
+    def test_autonomous_worker_prioritizes_inbox_and_matches_protocol_response(self) -> None:
+        from tempfile import TemporaryDirectory
+
+        with TemporaryDirectory() as directory:
+            todo_list = TodoList()
+            todo_list.create(["Inbox task", "Board task"])
+            communication = SubagentCommunication(
+                directory,
+                request_id="autonomous-inbox",
+            )
+            communication.register_task("worker-a")
+            request = communication.create_protocol_request(
+                protocol_type="task",
+                sender="main",
+                target="worker-a",
+                payload={
+                    "task_id": "todo-2",
+                    "instructions": "Handle the inbox task.",
+                    "dependencies": [],
+                    "tool_names": [],
+                },
+            )
+            host = self._host_with_child_response(
+                json.dumps(
+                    {
+                        "status": "completed",
+                        "summary": "inbox task finished",
+                    }
+                )
+            )
+            events: list[tuple[str, dict]] = []
+            executor = SubtaskExecutor(
+                host,
+                todo_list,
+                progress_callback=lambda event_type, data: events.append(
+                    (event_type, data)
+                ),
+                child_agent_factory=host.child_factory,
+                communication=communication,
+            )
+            worker = AutonomousTaskWorker(
+                executor,
+                "worker-a",
+                poll_interval=0.01,
+                idle_timeout=0.05,
+            )
+            worker.start()
+            worker.join(timeout=1)
+
+            self.assertFalse(worker.is_alive)
+            self.assertEqual(todo_list.get("todo-2").status, "completed")
+            self.assertEqual(todo_list.get("todo-2").owner, "worker-a")
+            claimed = [
+                data
+                for event_type, data in events
+                if event_type == "autonomous_task_claimed"
+            ]
+            self.assertEqual(claimed[0]["source"], "inbox")
+            self.assertEqual(claimed[0]["task_id"], "todo-2")
+            self.assertEqual(
+                todo_list.get("todo-1").status,
+                "completed",
+            )
+            self.assertEqual(
+                communication.get_protocol_state(
+                    request["protocol_request_id"]
+                )["status"],
+                "approved",
+            )
+            self.assertEqual(
+                communication.consume_inbox("main")["count"],
+                0,
+            )
+
+    def test_autonomous_worker_keeps_blocked_inbox_task_for_later(self) -> None:
+        from tempfile import TemporaryDirectory
+
+        with TemporaryDirectory() as directory:
+            todo_list = TodoList()
+            todo_list.create(
+                [
+                    "Dependency",
+                    {"task": "Inbox task", "dependencies": ["todo-1"]},
+                    "Board task",
+                ]
+            )
+            communication = SubagentCommunication(
+                directory,
+                request_id="autonomous-blocked-inbox",
+            )
+            request = communication.create_protocol_request(
+                protocol_type="task",
+                sender="main",
+                target="worker-a",
+                payload={
+                    "task_id": "todo-2",
+                    "instructions": "Wait for the dependency, then run.",
+                    "dependencies": ["todo-1"],
+                    "tool_names": [],
+                },
+            )
+            events: list[tuple[str, dict]] = []
+            host = self._host_with_child_response(
+                json.dumps({"status": "completed", "summary": "done"})
+            )
+            executor = SubtaskExecutor(
+                host,
+                todo_list,
+                progress_callback=lambda event_type, data: events.append(
+                    (event_type, data)
+                ),
+                child_agent_factory=host.child_factory,
+                communication=communication,
+            )
+            worker = AutonomousTaskWorker(
+                executor,
+                "worker-a",
+                poll_interval=0.01,
+                idle_timeout=0.05,
+            )
+            self.assertFalse(worker._consume_inbox(communication))
+            self.assertEqual(todo_list.get("todo-2").status, "pending")
+            self.assertEqual(
+                communication.peek_inbox("worker-a")["count"],
+                1,
+            )
+            self.assertEqual(
+                communication.get_protocol_state(
+                    request["protocol_request_id"]
+                )["status"],
+                "pending",
+            )
+
+    def test_chat_service_maps_autonomous_events(self) -> None:
+        service = ChatService(Mock())
+        state = service._start_state("request")
+        service._on_agent_progress(
+            "autonomous_task_claimed",
+            {"agent_name": "worker-a", "task_id": "todo-1"},
+        )
+        service._on_agent_progress(
+            "autonomous_shutdown",
+            {"agent_name": "worker-a", "reason": "idle timeout"},
+        )
+
+        self.assertEqual(
+            state.events[-2].event_type,
+            EventType.AUTONOMOUS_TASK_CLAIMED,
+        )
+        self.assertEqual(
+            state.events[-1].event_type,
+            EventType.AUTONOMOUS_SHUTDOWN,
+        )
+
+    def test_autonomous_worker_acknowledges_shutdown_request(self) -> None:
+        from tempfile import TemporaryDirectory
+
+        with TemporaryDirectory() as directory:
+            todo_list = TodoList()
+            todo_list.create(["Unrelated task"])
+            communication = SubagentCommunication(
+                directory,
+                request_id="autonomous-shutdown",
+            )
+            request = communication.create_protocol_request(
+                protocol_type="shutdown",
+                sender="main",
+                target="worker-a",
+                payload={"reason": "parent is shutting down"},
+            )
+            events: list[tuple[str, dict]] = []
+            host = self._host_with_child_response(
+                json.dumps({"status": "completed", "summary": "unused"})
+            )
+            executor = SubtaskExecutor(
+                host,
+                todo_list,
+                progress_callback=lambda event_type, data: events.append(
+                    (event_type, data)
+                ),
+                child_agent_factory=host.child_factory,
+                communication=communication,
+            )
+            worker = AutonomousTaskWorker(
+                executor,
+                "worker-a",
+                poll_interval=0.01,
+                idle_timeout=1,
+            )
+            worker.start()
+            worker.join(timeout=1)
+
+            self.assertFalse(worker.is_alive)
+            self.assertEqual(
+                communication.get_protocol_state(
+                    request["protocol_request_id"]
+                )["status"],
+                "approved",
+            )
+            self.assertEqual(
+                [data["reason"] for name, data in events if name == "autonomous_shutdown"],
+                ["shutdown request"],
+            )
 
     @staticmethod
     def _response(text: str = "", tool_calls: list[ToolCall] | None = None):

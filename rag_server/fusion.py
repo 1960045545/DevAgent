@@ -19,6 +19,7 @@ def rrf_fuse(
     merged: dict[str, SearchHit] = {}
     scores: dict[str, float] = {}
     sources: dict[str, set[str]] = {}
+    raw_scores: dict[str, dict[str, float]] = {}
 
     for source, hits in (
         ("keyword", keyword_hits),
@@ -31,6 +32,7 @@ def rrf_fuse(
                 1.0 / (rrf_k + rank)
             )
             sources.setdefault(hit.chunk_id, set()).add(source)
+            raw_scores.setdefault(hit.chunk_id, {})[source] = hit.score
 
     fused: list[SearchHit] = []
     for hit in merged.values():
@@ -40,10 +42,14 @@ def rrf_fuse(
                 doc_id=hit.doc_id,
                 content=hit.content,
                 title=hit.title,
+                version_id=hit.version_id,
                 source_uri=hit.source_uri,
                 tenant_id=hit.tenant_id,
                 score=scores[hit.chunk_id],
                 sources=tuple(sorted(sources[hit.chunk_id])),
+                keyword_score=raw_scores[hit.chunk_id].get("keyword"),
+                vector_score=raw_scores[hit.chunk_id].get("vector"),
+                rrf_score=scores[hit.chunk_id],
                 metadata=dict(hit.metadata),
             )
         )

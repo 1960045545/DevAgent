@@ -13,6 +13,16 @@ from rag_server.schemas import (
 SearchFilters = Mapping[str, object]
 
 
+class QueryRewriter(Protocol):
+    def rewrite(self, query: str) -> Sequence[str] | str:
+        ...
+
+
+class QueryRouter(Protocol):
+    def route(self, query: str) -> str:
+        ...
+
+
 class EmbeddingProvider(Protocol):
     model_name: str
     dimension: int

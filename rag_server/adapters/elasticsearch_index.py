@@ -49,7 +49,8 @@ class ElasticsearchKeywordIndex:
             }
             for chunk in chunks
         ]
-        helpers.bulk(self.client, actions)
+        # Make a just-ingested document visible to the next search request.
+        helpers.bulk(self.client, actions, refresh="wait_for")
 
     def delete_document(self, doc_id: str) -> None:
         self.ensure_index()
@@ -169,7 +170,7 @@ class ElasticsearchKeywordIndex:
         if "is_active" not in provided:
             clauses.append({"term": {"is_active": True}})
         for key, value in provided.items():
-            if isinstance(value, (list, tuple, set)):
+            if isinstance(value, (list, tuple, set, frozenset)):
                 clauses.append({"terms": {key: list(value)}})
             else:
                 clauses.append({"term": {key: value}})

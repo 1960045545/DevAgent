@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 import logging
 import os
 from dataclasses import replace
@@ -14,12 +13,18 @@ from core.delegation import SubtaskExecutor
 from core.message import Message
 from core.response import ModelResponse
 from core.skills import Skill, SkillLoader, SkillToolset
+from core.subagent_communication import (
+    SubagentCommunication,
+    SubagentCommunicationToolset,
+)
 from core.tool_registry import ToolRegistry
 from core.tool_hooks import ToolHook
 from core.tool_space import ToolSpec
 from core.todo import TodoToolset, is_complex_task
+from core.worktree import WorktreeManager, WorktreeToolset
 from manager.llm_manager import LLMManager
 from manager.memory_manager import MemoryManager
+from manager.message_compactor import MessageCompactionPipeline
 from manager.model_provider_manager import ModelProviderConfig
 from manager.prompt_manager import PromptManager
 from manager.tool_manager import ToolManager
@@ -80,6 +85,8 @@ class Agent:
                 os.getenv("AGENT_WORKSPACE_ROOT", str(self.startup_dir))
             ).expanduser().resolve()
         )
+        self.worktree_manager = WorktreeManager(self.workspace_root)
+        self.worktree_toolset = WorktreeToolset(self.worktree_manager, None)
         self.skill_loader = SkillLoader(self.skills_dir)
         self.skills: tuple[Skill, ...] = self.skill_loader.load()
         self.skill_toolset = SkillToolset(self.skill_loader)
@@ -137,6 +144,12 @@ class Agent:
         )
         if self.background_manager is not None:
             self.background_manager.register(self.tool_registry)
+        self.tool_manager.set_background_manager(self.background_manager)
+        self.tool_manager.set_compaction_pipeline(
+            MessageCompactionPipeline(
+                transcript_writer=self.memory_manager.write_runtime_transcript,
+            )
+        )
         logger.info(
             "agent initialized model=%s providers=%s skills=%s",
             self.model_id,
@@ -196,6 +209,38 @@ class Agent:
     def unregister_tool_hook(self, hook: ToolHook) -> None:
         self.tool_manager.unregister_hook(hook)
 
+    def register_mcp_tool(
+        self,
+        spec: ToolSpec,
+        handler: Callable[..., Any],
+        *,
+        server_name: str | None = None,
+    ) -> str:
+        return self.tool_manager.register_mcp_tool(
+            spec,
+            handler,
+            server_name=server_name,
+        )
+
+    def register_mcp_tools(
+        self,
+        specs: list[ToolSpec],
+        handlers: dict[str, Callable[..., Any]],
+        *,
+        server_name: str | None = None,
+    ) -> list[str]:
+        return self.tool_manager.register_mcp_tools(
+            specs,
+            handlers,
+            server_name=server_name,
+        )
+
+    def connect_mcp(self, server_name: str, provider: Any) -> list[str]:
+        return self.tool_manager.connect_mcp(server_name, provider)
+
+    def disconnect_mcp(self, server_name: str) -> list[str]:
+        return self.tool_manager.disconnect_mcp(server_name)
+
     def record_skill_result(
         self,
         skill_name: str,
@@ -231,6 +276,11 @@ class Agent:
     ) -> ModelResponse:
         logger.info("chat start")
         self.memory_manager.compress_if_needed()
+        prompt_context = self.tool_manager.run_user_prompt_hooks(
+            user_message,
+            progress_callback=progress_callback,
+        )
+        self.worktree_manager.observer = progress_callback
         request_options = options or InvokeOptions()
         todo_toolset = self._build_todo_toolset(
             user_message,
@@ -268,23 +318,38 @@ class Agent:
                 ),
                 progress_callback=progress_callback,
                 tool_result_callback=self._record_tool_result,
-                prompt_builder=lambda: self._build_chat_system_prompt(
-                    enabled_tools=request_options.tools,
+                injected_messages=prompt_context.injected_messages,
+                prompt_builder=lambda enabled_tools: self._build_chat_system_prompt(
+                    enabled_tools=enabled_tools,
                     todo_toolset=todo_toolset,
                 ),
             )
         else:
             logger.info("chat route=normal")
-            response = self.llm_manager.invoke_messages(
-                [
-                    Message(
-                        role="system",
-                        content=system_prompt,
-                    ).to_dict(),
-                    Message(role="user", content=user_message).to_dict(),
+            messages = [
+                Message(
+                    role="system",
+                    content=system_prompt,
+                ).to_dict(),
+                *[
+                    dict(injected)
+                    for injected in prompt_context.injected_messages
                 ],
+                Message(role="user", content=user_message).to_dict(),
+            ]
+            self.tool_manager.prepare_messages(
+                messages,
+                progress_callback=progress_callback,
+            )
+            response = self.llm_manager.invoke_messages(
+                messages,
                 options=request_options,
                 purpose="chat",
+            )
+            self.tool_manager.notify_stop(
+                response,
+                messages,
+                progress_callback=progress_callback,
             )
 
         self._finish_chat_turn(
@@ -302,6 +367,11 @@ class Agent:
     ) -> Iterator[str]:
         logger.info("stream_chat start")
         self.memory_manager.compress_if_needed()
+        prompt_context = self.tool_manager.run_user_prompt_hooks(
+            user_message,
+            progress_callback=progress_callback,
+        )
+        self.worktree_manager.observer = progress_callback
         request_options = options or InvokeOptions()
         todo_toolset = self._build_todo_toolset(
             user_message,
@@ -339,8 +409,9 @@ class Agent:
                 ),
                 progress_callback=progress_callback,
                 tool_result_callback=self._record_tool_result,
-                prompt_builder=lambda: self._build_chat_system_prompt(
-                    enabled_tools=request_options.tools,
+                injected_messages=prompt_context.injected_messages,
+                prompt_builder=lambda enabled_tools: self._build_chat_system_prompt(
+                    enabled_tools=enabled_tools,
                     todo_toolset=todo_toolset,
                 ),
             )
@@ -354,19 +425,34 @@ class Agent:
         chunks: list[str] = []
 
         logger.info("stream_chat route=normal")
-        for chunk in self.llm_manager.stream_messages(
-            [
-                Message(
-                    role="system",
-                    content=system_prompt,
-                ).to_dict(),
-                Message(role="user", content=user_message).to_dict(),
+        messages = [
+            Message(
+                role="system",
+                content=system_prompt,
+            ).to_dict(),
+            *[
+                dict(injected)
+                for injected in prompt_context.injected_messages
             ],
+            Message(role="user", content=user_message).to_dict(),
+        ]
+        self.tool_manager.prepare_messages(
+            messages,
+            progress_callback=progress_callback,
+        )
+        for chunk in self.llm_manager.stream_messages(
+            messages,
             options=request_options,
             purpose="chat",
         ):
             chunks.append(chunk)
             yield chunk
+
+        self.tool_manager.notify_stop(
+            ModelResponse(text="".join(chunks)),
+            messages,
+            progress_callback=progress_callback,
+        )
 
         self._finish_chat_turn(
             user_message=user_message,
@@ -403,23 +489,7 @@ class Agent:
         )
 
     def _operation_history_prompt(self) -> str:
-        operation_history = self.memory_manager.get_operation_prompt_text()
-        if self.background_manager is None:
-            return operation_history
-        notifications = self.background_manager.notifications(consume=False)
-        if not notifications["count"]:
-            return operation_history
-        background_text = (
-            "未读后台任务通知：\n"
-            + json.dumps(
-                notifications["notifications"],
-                ensure_ascii=False,
-                default=str,
-            )
-        )
-        return "\n\n".join(
-            part for part in (operation_history, background_text) if part
-        )
+        return self.memory_manager.get_operation_prompt_text()
 
     def _merge_runtime_tools(
         self,
@@ -428,10 +498,20 @@ class Agent:
     ) -> InvokeOptions:
         extra_specs = list(self.skill_toolset.specs)
         extra_handlers = dict(self.skill_toolset.handlers)
+        worktree_toolset = self.worktree_toolset
         if todo_toolset is not None:
             extra_specs.extend(todo_toolset.specs)
             extra_handlers.update(todo_toolset.handlers)
-        return self.tool_manager.merge_options(
+            worktree_toolset = todo_toolset.worktree_toolset or worktree_toolset
+        if worktree_toolset is not None:
+            known_names = {spec.name for spec in extra_specs}
+            extra_specs.extend(
+                spec
+                for spec in worktree_toolset.specs
+                if spec.name not in known_names
+            )
+            extra_handlers.update(worktree_toolset.handlers)
+        return self.tool_manager.assemble_tool_pool(
             options,
             extra_specs=extra_specs or None,
             extra_handlers=extra_handlers or None,
@@ -476,12 +556,37 @@ class Agent:
         if not is_complex_task(user_message):
             return None
 
-        todo_toolset = TodoToolset(observer=progress_callback)
+        communication = SubagentCommunication(self.workspace_root)
+        communication_toolset = SubagentCommunicationToolset(
+            communication,
+            "main",
+        )
+        todo_toolset = TodoToolset(
+            observer=progress_callback,
+            communication_toolset=communication_toolset,
+        )
+        self.worktree_manager.scope_id = communication.request_id
+        self.worktree_manager.observer = progress_callback
+        worktree_toolset = WorktreeToolset(
+            self.worktree_manager,
+            todo_toolset.todo_list,
+        )
+        todo_toolset.worktree_toolset = worktree_toolset
         executor = SubtaskExecutor(
             self,
             todo_toolset.todo_list,
             progress_callback=progress_callback,
+            communication=communication,
+            worktree_manager=self.worktree_manager,
         )
+        if progress_callback is not None:
+            progress_callback(
+                "subagent_communication_ready",
+                {
+                    "request_id": communication.request_id,
+                    "communication_root": communication.relative_root,
+                },
+            )
         todo_toolset.delegate_handler = executor.delegate
         shell_runner = self.tool_registry.get_handler("workspace_run_shell")
         shell_owner = getattr(shell_runner, "__self__", None)

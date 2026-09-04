@@ -394,6 +394,16 @@ class WorkspaceToolset:
                 f"{workspace_root}",
             )
 
+    def for_workspace(
+        self,
+        workspace_root: str | Path,
+    ) -> "WorkspaceToolset":
+        """Create the same policy-bound toolset for another workspace root."""
+        return type(self)(
+            replace(self.settings, workspace_root=Path(workspace_root)),
+            approval_callback=self.approval_callback,
+        )
+
     def list_files(
         self,
         path: str = ".",

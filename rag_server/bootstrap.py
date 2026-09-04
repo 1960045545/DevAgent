@@ -13,6 +13,7 @@ from rag_server.adapters.embedding import QwenEmbeddingProvider
 from rag_server.adapters.milvus_index import MilvusVectorIndex
 from rag_server.adapters.mysql_repository import MySQLDocumentRepository
 from rag_server.adapters.qwen_reranker import Qwen3Reranker
+from rag_server.chunker import MarkdownChunker, TextChunker
 from rag_server.config import RagSettings
 from rag_server.service import RagService
 
@@ -33,6 +34,7 @@ def build_in_memory_service(
         document_repository=InMemoryDocumentRepository(),
         keyword_index=InMemoryKeywordIndex(),
         vector_index=InMemoryVectorIndex(),
+        chunker=_build_chunker(resolved_settings),
     )
 
 
@@ -65,4 +67,17 @@ def build_rag_service(
             dimension=dimension,
         ),
         reranker=Qwen3Reranker(resolved_settings),
+        chunker=_build_chunker(resolved_settings),
+    )
+
+
+def _build_chunker(settings: RagSettings) -> TextChunker:
+    chunker_type = (
+        MarkdownChunker
+        if settings.chunk_strategy == "markdown"
+        else TextChunker
+    )
+    return chunker_type(
+        chunk_size=settings.chunk_size,
+        chunk_overlap=settings.chunk_overlap,
     )

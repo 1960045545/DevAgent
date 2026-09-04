@@ -313,6 +313,67 @@ class BackgroundTaskManager:
                 )
 
 
+class BackgroundToolDispatcher:
+    """Dispatch supported long-running tool calls to the background pool."""
+
+    def __init__(self, manager: BackgroundTaskManager) -> None:
+        self.manager = manager
+
+    @staticmethod
+    def should_run(tool_call: Any, handler: Callable[..., Any]) -> bool:
+        if getattr(tool_call, "name", "") != "workspace_run_shell":
+            return False
+        arguments = getattr(tool_call, "arguments", None)
+        if not isinstance(arguments, dict):
+            return False
+        command = str(arguments.get("command", ""))
+        owner = getattr(handler, "__self__", None)
+        detector = getattr(owner, "_is_long_running_command", None)
+        return bool(callable(detector) and detector(command))
+
+    def dispatch(
+        self,
+        tool_call: Any,
+        handler: Callable[..., Any],
+        *,
+        observer: BackgroundObserver | None = None,
+    ) -> dict[str, Any]:
+        arguments = dict(getattr(tool_call, "arguments", {}) or {})
+        command = str(arguments.get("command", "")).strip()
+        working_directory = str(arguments.get("working_directory", "."))
+        owner = getattr(handler, "__self__", None)
+        preflight = getattr(owner, "preflight_background_shell", None)
+        if not callable(preflight):
+            raise ValueError(
+                "workspace shell handler does not support background preflight"
+            )
+        preflight(command, working_directory)
+        arguments.setdefault("timeout_seconds", 1800)
+
+        def operation() -> Any:
+            return handler(**arguments, _background=True)
+
+        job = self.manager.submit(
+            name=command,
+            operation=operation,
+            metadata={
+                "tool_call_id": getattr(tool_call, "id", None),
+                "tool_name": getattr(tool_call, "name", ""),
+                "command": command,
+                "working_directory": working_directory,
+            },
+            observer=observer,
+        )
+        return {
+            "status": "background_started",
+            "message": (
+                "Long-running command started in the background. Continue "
+                "other work; completion will arrive as <task_notification>."
+            ),
+            "job": job,
+        }
+
+
 class TodoBackgroundExecutor:
     """Connect one background shell job to a Todo Task lifecycle."""
 

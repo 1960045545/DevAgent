@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 from threading import RLock
 from typing import Any, Callable, Literal
@@ -95,6 +96,12 @@ TODO_CLAIM_SPEC = ToolSpec(
                 "type": "string",
                 "description": "Optional progress note.",
                 "default": "",
+            },
+            "owner": {
+                "type": "string",
+                "minLength": 1,
+                "description": "Stable agent identity claiming this task.",
+                "default": "main",
             },
         },
         "required": ["task_id"],
@@ -261,9 +268,11 @@ class Task:
     summary: str = ""
     status: TaskStatus = "pending"
     dependencies: list[str] = field(default_factory=list)
+    owner: str | None = None
     blocked_reason: str = ""
     execution_mode: TaskExecutionMode = "foreground"
     background_job_id: str | None = None
+    worktree: str | None = None
 
     # Compatibility aliases used by the previous TodoItem API.
     @property
@@ -289,9 +298,11 @@ class Task:
             "summary": self.summary,
             "status": self.status,
             "dependencies": list(self.dependencies),
+            "owner": self.owner,
             "blocked_reason": self.blocked_reason,
             "execution_mode": self.execution_mode,
             "background_job_id": self.background_job_id,
+            "worktree": self.worktree,
         }
 
     def to_legacy_dict(self) -> dict[str, Any]:
@@ -387,6 +398,10 @@ class TodoItem:
     def dependencies(self) -> list[str]:
         return list(self._task.dependencies)
 
+    @property
+    def owner(self) -> str | None:
+        return self._task.owner
+
     def to_dict(self) -> dict[str, Any]:
         return self._task.to_legacy_dict()
 
@@ -397,6 +412,14 @@ def _canonical_status(status: str) -> TaskStatus:
     if status not in {"pending", "in_process", "completed", "blocked", "failed"}:
         raise ValueError(f"unsupported todo status: {status}")
     return status  # type: ignore[return-value]
+
+
+def _validate_owner(owner: str) -> str:
+    if not isinstance(owner, str) or not owner.strip():
+        raise ValueError("task owner cannot be empty")
+    if len(owner.strip()) > 128:
+        raise ValueError("task owner is too long")
+    return owner.strip()
 
 
 class TodoList:
@@ -585,6 +608,8 @@ class TodoList:
                     + (f": {reason}" if reason else "")
                 )
             task.status = next_status
+            if next_status == "in_process" and not task.owner:
+                task.owner = "agent"
             if note.strip():
                 task.summary = note.strip()
             if next_status == "blocked":
@@ -604,8 +629,14 @@ class TodoList:
         self._emit("todo_updated", event_data)
         return snapshot
 
-    def claim(self, task_id: str, note: str = "") -> dict[str, Any]:
+    def claim(
+        self,
+        task_id: str,
+        note: str = "",
+        owner: str = "agent",
+    ) -> dict[str, Any]:
         """Atomically perform ``pending -> claim -> in_process``."""
+        owner = _validate_owner(owner)
         with self._lock:
             task = self._get_locked(task_id)
             if task.status != "pending":
@@ -613,12 +644,17 @@ class TodoList:
                     f"task {task_id} can only be claimed from pending, "
                     f"current status is {task.status}"
                 )
+            if task.owner:
+                raise ValueError(
+                    f"task {task_id} is already owned by {task.owner}"
+                )
             if not self._is_ready_locked(task):
                 reason = self._dependency_block_reason_locked(task)
                 raise ValueError(
                     f"task {task_id} is not ready for execution"
                     + (f": {reason}" if reason else "")
                 )
+            task.owner = owner
             task.status = "in_process"
             if note.strip():
                 task.summary = note.strip()
@@ -627,6 +663,76 @@ class TodoList:
                 snapshot,
                 task_id,
                 action="claim",
+            )
+        self._emit("todo_updated", event_data)
+        return snapshot
+
+    def can_start(self, task_id: str) -> bool:
+        """Return whether a task is pending, unowned, and dependency-ready."""
+        with self._lock:
+            return self._is_ready_locked(self._get_locked(task_id))
+
+    def scan_unclaimed_tasks(self) -> list[dict[str, Any]]:
+        """List pending, unowned tasks whose dependencies are complete."""
+        with self._lock:
+            return [
+                self._task_snapshot_locked(task)
+                for task in self._tasks
+                if task.status == "pending"
+                and not task.owner
+                and self._can_start_locked(task)
+            ]
+
+    def claim_next(self, owner: str = "agent") -> dict[str, Any] | None:
+        """Claim the first currently executable unowned task atomically."""
+        owner = _validate_owner(owner)
+        with self._lock:
+            task = next(
+                (
+                    task
+                    for task in self._tasks
+                    if task.status == "pending"
+                    and not task.owner
+                    and self._can_start_locked(task)
+                ),
+                None,
+            )
+            if task is None:
+                return None
+            task.owner = owner
+            task.status = "in_process"
+            if not task.summary:
+                task.summary = f"claimed by {owner}"
+            snapshot = self.snapshot()
+            event_data = self._task_event_data(
+                snapshot,
+                task.task_id,
+                action="claim",
+            )
+        self._emit("todo_updated", event_data)
+        return task.to_dict()
+
+    def bind_worktree(self, task_id: str, worktree: str) -> dict[str, Any]:
+        """Bind a task to a worktree without changing its execution state."""
+        worktree = str(worktree).strip()
+        if (
+            not re.fullmatch(r"[A-Za-z0-9._-]{1,64}", worktree)
+            or worktree in {".", ".."}
+        ):
+            raise ValueError("invalid worktree name")
+        with self._lock:
+            task = self._get_locked(task_id)
+            if task.worktree and task.worktree != worktree:
+                raise ValueError(
+                    f"task {task_id} is already bound to worktree "
+                    f"{task.worktree}"
+                )
+            task.worktree = worktree
+            snapshot = self.snapshot()
+            event_data = self._task_event_data(
+                snapshot,
+                task_id,
+                action="worktree_bind",
             )
         self._emit("todo_updated", event_data)
         return snapshot
@@ -704,6 +810,7 @@ class TodoList:
                     f"{task.background_job_id}"
                 )
             previous_status = task.status
+            previous_owner = task.owner
             previous_summary = task.summary
             previous_mode = task.execution_mode
             if task.status == "pending":
@@ -719,6 +826,8 @@ class TodoList:
                     f"task {task_id} cannot start background work from "
                     f"{task.status}"
                 )
+            if not task.owner:
+                task.owner = "background"
             task.execution_mode = "background"
             if summary.strip():
                 task.summary = summary.strip()
@@ -728,6 +837,7 @@ class TodoList:
                     raise ValueError("background submitter returned an empty job id")
             except Exception:
                 task.status = previous_status
+                task.owner = previous_owner
                 task.summary = previous_summary
                 task.execution_mode = previous_mode
                 raise
@@ -787,12 +897,24 @@ class TodoList:
             )
 
     def _is_ready_locked(self, task: Task) -> bool:
-        if task.status != "pending":
+        if task.status != "pending" or task.owner:
             return False
+        return self._can_start_locked(task)
+
+    def _can_start_locked(self, task: Task) -> bool:
         return all(
             self._get_locked(dependency).status == "completed"
             for dependency in task.dependencies
         )
+
+    def _task_snapshot_locked(self, task: Task) -> dict[str, Any]:
+        snapshot = task.to_dict()
+        snapshot["can_start"] = (
+            task.status == "pending"
+            and not task.owner
+            and self._can_start_locked(task)
+        )
+        return snapshot
 
     def _dependency_block_reason_locked(self, task: Task) -> str:
         for dependency_id in task.dependencies:
@@ -914,7 +1036,7 @@ class TodoList:
             for dependency in task.dependencies
         ]
         return {
-            "nodes": [task.to_dict() for task in self._tasks],
+            "nodes": [self._task_snapshot_locked(task) for task in self._tasks],
             "edges": edges,
             "topological_order": self._topological_order_locked(),
         }
@@ -974,12 +1096,22 @@ class TodoList:
                 if task.status == "blocked"
             ]
             return {
-                "tasks": [task.to_dict() for task in self._tasks],
+                "tasks": [
+                    self._task_snapshot_locked(task)
+                    for task in self._tasks
+                ],
                 # Kept for clients written against the original TodoList API.
                 "todos": [task.to_legacy_dict() for task in self._tasks],
                 "edges": graph["edges"],
                 "graph": graph,
                 "ready_task_ids": ready_task_ids,
+                "unclaimed_task_ids": [
+                    task.task_id
+                    for task in self._tasks
+                    if task.status == "pending"
+                    and not task.owner
+                    and self._can_start_locked(task)
+                ],
                 "blocked_task_ids": blocked_task_ids,
                 "pending_task_ids": [
                     task.task_id
@@ -1021,10 +1153,14 @@ class TodoToolset:
         observer: TodoObserver | None = None,
         delegate_handler: Callable[..., Any] | None = None,
         background_handler: Callable[..., Any] | None = None,
+        communication_toolset: Any | None = None,
+        worktree_toolset: Any | None = None,
     ) -> None:
         self.todo_list = TodoList(observer=observer)
         self.delegate_handler = delegate_handler
         self.background_handler = background_handler
+        self.communication_toolset = communication_toolset
+        self.worktree_toolset = worktree_toolset
 
     @property
     def specs(self) -> list[ToolSpec]:
@@ -1040,13 +1176,17 @@ class TodoToolset:
             specs.append(TODO_DELEGATE_SPEC)
         if self.background_handler is not None:
             specs.append(TODO_BACKGROUND_RUN_SPEC)
+        if self.communication_toolset is not None:
+            specs.extend(self.communication_toolset.specs)
+        if self.worktree_toolset is not None:
+            specs.extend(self.worktree_toolset.specs)
         return specs
 
     @property
     def handlers(self) -> dict[str, Callable[..., Any]]:
         handlers = {
-            "todo_create": self.todo_list.create,
-            "todo_claim": self.todo_list.claim,
+            "todo_create": self._create,
+            "todo_claim": self._claim,
             "todo_complete": self.todo_list.complete,
             "todo_block": self.todo_list.block,
             "todo_update": self.todo_list.update_legacy,
@@ -1056,7 +1196,31 @@ class TodoToolset:
             handlers["todo_delegate"] = self.delegate_handler
         if self.background_handler is not None:
             handlers["todo_run_background"] = self.background_handler
+        if self.communication_toolset is not None:
+            handlers.update(self.communication_toolset.handlers)
+        if self.worktree_toolset is not None:
+            handlers.update(self.worktree_toolset.handlers)
         return handlers
+
+    def _create(self, items: list[TodoCreateItem]) -> dict[str, Any]:
+        snapshot = self.todo_list.create(items)
+        if self.communication_toolset is not None:
+            for task in self.todo_list.tasks:
+                self.communication_toolset.communication.register_task(
+                    task.task_id,
+                    task=task.task,
+                    summary=task.summary,
+                    dependencies=list(task.dependencies),
+                )
+        return snapshot
+
+    def _claim(
+        self,
+        task_id: str,
+        note: str = "",
+        owner: str = "main",
+    ) -> dict[str, Any]:
+        return self.todo_list.claim(task_id, note=note, owner=owner)
 
 
 TODO_DELEGATE_SPEC = ToolSpec(

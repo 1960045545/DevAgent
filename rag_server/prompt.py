@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
+from typing import Any
 
 from rag_server.schemas import SearchHit
 
@@ -38,3 +39,31 @@ def build_grounded_prompt(
         f"知识库证据：\n{context}\n\n"
         f"用户问题：\n{query}"
     )
+
+
+def build_grounded_messages(
+    query: str,
+    hits: Sequence[SearchHit],
+) -> list[dict[str, Any]]:
+    """Return separate system/user messages for chat-completion clients."""
+    context = build_context(hits)
+    if not context:
+        context = "没有检索到可用的知识库证据。"
+
+    return [
+        {
+            "role": "system",
+            "content": (
+                "你是知识库问答助手。只能依据用户消息中的证据回答；"
+                "证据不足时明确说明，不得编造。每个事实性结论都要用"
+                "[证据 N] 引用，证据编号必须对应原文。"
+            ),
+        },
+        {
+            "role": "user",
+            "content": (
+                f"知识库证据：\n{context}\n\n"
+                f"用户问题：\n{query.strip()}"
+            ),
+        },
+    ]
